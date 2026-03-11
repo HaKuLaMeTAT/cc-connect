@@ -7,6 +7,12 @@
 
 [English](./README.md) | 中文
 
+> Fork 说明
+>
+> 本仓库 fork 自 [chenhg5/cc-connect](https://github.com/chenhg5/cc-connect)。
+> 当前版本基于我自己的使用场景和需求做了定制修改与维护。
+> 这是个人维护分支，不代表上游官方版本。
+
 **在任何聊天工具里，远程操控你的本地 AI Agent**
 
 cc-connect 把运行在你机器上的 AI Agent 桥接到你日常使用的即时通讯工具。代码审查、资料研究、自动化任务、数据分析 —— 只要 AI Agent 能做的事，都能通过手机、平板或任何有聊天应用的设备来完成。

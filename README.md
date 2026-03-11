@@ -7,6 +7,12 @@
 
 English | [中文](./README.zh-CN.md)
 
+> Fork Note
+>
+> This repository is forked from [chenhg5/cc-connect](https://github.com/chenhg5/cc-connect).
+> It has been modified and maintained based on my own workflow and usage needs.
+> This is a personal fork and is not an official upstream release.
+
 **Control your local AI agents from any chat app. Anywhere, anytime.**
 
 cc-connect bridges AI agents running on your machine to the messaging platforms you already use. Code review, research, automation, data analysis — anything an AI agent can do, now accessible from your phone, tablet, or any device with a chat app.
