@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -35,6 +36,20 @@ type Platform struct {
 	handler               core.MessageHandler
 	cancel                context.CancelFunc
 }
+
+type storedReplyText struct {
+	fullText  string
+	expiresAt time.Time
+}
+
+var telegramReplyRegistry = struct {
+	mu     sync.Mutex
+	byChat map[int64]map[int]storedReplyText
+}{
+	byChat: make(map[int64]map[int]storedReplyText),
+}
+
+const telegramReplyRegistryTTL = 24 * time.Hour
 
 func New(opts map[string]any) (core.Platform, error) {
 	token, _ := opts["token"].(string)
@@ -161,10 +176,12 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 					coreMsg := &core.Message{
 						SessionKey: sessionKey, Platform: "telegram",
 						UserID: userID, UserName: userName,
-						Content:   caption,
-						MessageID: strconv.Itoa(msg.MessageID),
-						Images:    []core.ImageAttachment{{MimeType: "image/jpeg", Data: imgData}},
-						ReplyCtx:  rctx,
+						Content:          caption,
+						MessageID:        strconv.Itoa(msg.MessageID),
+						ReplyToMessageID: telegramReplyToMessageID(msg),
+						ReplyToContent:   telegramReplyToContent(msg),
+						Images:           []core.ImageAttachment{{MimeType: "image/jpeg", Data: imgData}},
+						ReplyCtx:         rctx,
 					}
 					p.handler(p, coreMsg)
 					continue
@@ -181,7 +198,9 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 					coreMsg := &core.Message{
 						SessionKey: sessionKey, Platform: "telegram",
 						UserID: userID, UserName: userName,
-						MessageID: strconv.Itoa(msg.MessageID),
+						MessageID:        strconv.Itoa(msg.MessageID),
+						ReplyToMessageID: telegramReplyToMessageID(msg),
+						ReplyToContent:   telegramReplyToContent(msg),
 						Audio: &core.AudioAttachment{
 							MimeType: msg.Voice.MimeType,
 							Data:     audioData,
@@ -212,7 +231,9 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 					coreMsg := &core.Message{
 						SessionKey: sessionKey, Platform: "telegram",
 						UserID: userID, UserName: userName,
-						MessageID: strconv.Itoa(msg.MessageID),
+						MessageID:        strconv.Itoa(msg.MessageID),
+						ReplyToMessageID: telegramReplyToMessageID(msg),
+						ReplyToContent:   telegramReplyToContent(msg),
 						Audio: &core.AudioAttachment{
 							MimeType: msg.Audio.MimeType,
 							Data:     audioData,
@@ -238,9 +259,11 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 				coreMsg := &core.Message{
 					SessionKey: sessionKey, Platform: "telegram",
 					UserID: userID, UserName: userName,
-					Content:   text,
-					MessageID: strconv.Itoa(msg.MessageID),
-					ReplyCtx:  rctx,
+					Content:          text,
+					MessageID:        strconv.Itoa(msg.MessageID),
+					ReplyToMessageID: telegramReplyToMessageID(msg),
+					ReplyToContent:   telegramReplyToContent(msg),
+					ReplyCtx:         rctx,
 				}
 
 				slog.Debug("telegram: message received", "user", userName, "chat", msg.Chat.ID)
@@ -463,6 +486,25 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	return nil
 }
 
+func (p *Platform) SendGrouped(ctx context.Context, rctx any, fullContent string) error {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return fmt.Errorf("telegram: invalid reply context type %T", rctx)
+	}
+
+	chunks := splitTelegramMessage(fullContent, 4000)
+	var sentIDs []int
+	for _, chunk := range chunks {
+		sent, err := p.sendTelegramMessage(rc.chatID, chunk, nil, false, 0)
+		if err != nil {
+			return err
+		}
+		sentIDs = append(sentIDs, sent.MessageID)
+	}
+	storeTelegramReplyGroup(rc.chatID, sentIDs, fullContent)
+	return nil
+}
+
 // SendWithButtons sends a message with an inline keyboard.
 func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string, buttons [][]core.ButtonOption) error {
 	rc, ok := rctx.(replyContext)
@@ -495,6 +537,18 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 		}
 	}
 	return nil
+}
+
+func (p *Platform) ResolveReplyText(rctx any, repliedMessageID string) (string, bool) {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return "", false
+	}
+	msgID, err := strconv.Atoi(strings.TrimSpace(repliedMessageID))
+	if err != nil {
+		return "", false
+	}
+	return resolveTelegramReplyGroup(rc.chatID, msgID)
 }
 
 // DeletePreviewMessage deletes a stale preview message so the caller can send a fresh one.
@@ -553,12 +607,11 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 		return nil, fmt.Errorf("telegram: invalid reply context type %T", rctx)
 	}
 
-	msg := tgbotapi.NewMessage(rc.chatID, content)
-	msg.ParseMode = ""
-	sent, err := p.bot.Send(msg)
+	sent, err := p.sendTelegramMessage(rc.chatID, content, nil, false, 0)
 	if err != nil {
 		return nil, fmt.Errorf("telegram: send preview: %w", err)
 	}
+	storeTelegramReplyGroup(rc.chatID, []int{sent.MessageID}, content)
 	return &telegramPreviewHandle{chatID: rc.chatID, messageID: sent.MessageID}, nil
 }
 
@@ -594,12 +647,125 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 				}
 				return fmt.Errorf("telegram: edit message: %w", err2)
 			}
+			storeTelegramReplyGroup(h.chatID, []int{h.messageID}, content)
 			return nil
 		}
 		return fmt.Errorf("telegram: edit message: %w", err)
 	}
 	slog.Debug("telegram: UpdateMessage HTML success")
+	storeTelegramReplyGroup(h.chatID, []int{h.messageID}, content)
 	return nil
+}
+
+func (p *Platform) sendTelegramMessage(chatID int64, content string, markup any, reply bool, replyToMessageID int) (tgbotapi.Message, error) {
+	html := core.MarkdownToTelegramHTML(content)
+	msg := tgbotapi.NewMessage(chatID, html)
+	msg.ParseMode = tgbotapi.ModeHTML
+	if reply {
+		msg.ReplyToMessageID = replyToMessageID
+	}
+	if markup != nil {
+		msg.ReplyMarkup = markup
+	}
+
+	sent, err := p.bot.Send(msg)
+	if err != nil {
+		if strings.Contains(err.Error(), "can't parse") {
+			msg.Text = content
+			msg.ParseMode = ""
+			sent, err = p.bot.Send(msg)
+		}
+		if err != nil {
+			return tgbotapi.Message{}, fmt.Errorf("telegram: send: %w", err)
+		}
+	}
+	return sent, nil
+}
+
+func splitTelegramMessage(text string, maxLen int) []string {
+	if len(text) <= maxLen {
+		return []string{text}
+	}
+	var chunks []string
+	for len(text) > 0 {
+		if len(text) <= maxLen {
+			chunks = append(chunks, text)
+			break
+		}
+		end := maxLen
+		if idx := strings.LastIndex(text[:end], "\n"); idx > 0 && idx >= end/2 {
+			end = idx + 1
+		}
+		chunks = append(chunks, text[:end])
+		text = text[end:]
+	}
+	return chunks
+}
+
+func storeTelegramReplyGroup(chatID int64, messageIDs []int, fullText string) {
+	if len(messageIDs) == 0 || strings.TrimSpace(fullText) == "" {
+		return
+	}
+	now := time.Now()
+	expiresAt := now.Add(telegramReplyRegistryTTL)
+
+	telegramReplyRegistry.mu.Lock()
+	defer telegramReplyRegistry.mu.Unlock()
+	cleanupTelegramReplyRegistryLocked(now)
+	perChat := telegramReplyRegistry.byChat[chatID]
+	if perChat == nil {
+		perChat = make(map[int]storedReplyText)
+		telegramReplyRegistry.byChat[chatID] = perChat
+	}
+	for _, messageID := range messageIDs {
+		perChat[messageID] = storedReplyText{fullText: fullText, expiresAt: expiresAt}
+	}
+}
+
+func resolveTelegramReplyGroup(chatID int64, messageID int) (string, bool) {
+	now := time.Now()
+	telegramReplyRegistry.mu.Lock()
+	defer telegramReplyRegistry.mu.Unlock()
+	cleanupTelegramReplyRegistryLocked(now)
+	perChat := telegramReplyRegistry.byChat[chatID]
+	if perChat == nil {
+		return "", false
+	}
+	entry, ok := perChat[messageID]
+	if !ok {
+		return "", false
+	}
+	return entry.fullText, true
+}
+
+func cleanupTelegramReplyRegistryLocked(now time.Time) {
+	for chatID, perChat := range telegramReplyRegistry.byChat {
+		for messageID, entry := range perChat {
+			if now.After(entry.expiresAt) {
+				delete(perChat, messageID)
+			}
+		}
+		if len(perChat) == 0 {
+			delete(telegramReplyRegistry.byChat, chatID)
+		}
+	}
+}
+
+func telegramReplyToMessageID(msg *tgbotapi.Message) string {
+	if msg.ReplyToMessage == nil {
+		return ""
+	}
+	return strconv.Itoa(msg.ReplyToMessage.MessageID)
+}
+
+func telegramReplyToContent(msg *tgbotapi.Message) string {
+	if msg.ReplyToMessage == nil {
+		return ""
+	}
+	if strings.TrimSpace(msg.ReplyToMessage.Text) != "" {
+		return msg.ReplyToMessage.Text
+	}
+	return strings.TrimSpace(msg.ReplyToMessage.Caption)
 }
 
 func truncateForLog(s string, maxLen int) string {

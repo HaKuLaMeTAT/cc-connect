@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // Platform abstracts a messaging platform (Feishu, DingTalk, Slack, etc.).
@@ -88,6 +89,19 @@ type TypingIndicator interface {
 // MessageUpdater is an optional interface for platforms that support updating messages.
 type MessageUpdater interface {
 	UpdateMessage(ctx context.Context, replyCtx any, content string) error
+}
+
+// GroupedMessageSender is an optional interface for platforms that can send a
+// full response as multiple platform messages while preserving a mapping from
+// each chunk back to the original full text.
+type GroupedMessageSender interface {
+	SendGrouped(ctx context.Context, replyCtx any, fullContent string) error
+}
+
+// ReplyTextResolver is an optional interface for platforms that can resolve a
+// replied-to platform message back to its full original text.
+type ReplyTextResolver interface {
+	ResolveReplyText(replyCtx any, repliedMessageID string) (string, bool)
 }
 
 // ButtonOption represents a clickable inline button.
@@ -242,6 +256,31 @@ type CommandProvider interface {
 // agent-specific — they are NOT shared across different agent types.
 type SkillProvider interface {
 	SkillDirs() []string
+}
+
+// UsageQuota describes a rate limit window or quota bucket.
+type UsageQuota struct {
+	Label         string    `json:"label"`
+	WindowMinutes int       `json:"window_minutes"`
+	UsedPercent   float64   `json:"used_percent"`
+	ResetsAt      time.Time `json:"resets_at"`
+}
+
+// ContextUsage describes token consumption and rate limits for a session.
+type ContextUsage struct {
+	PromptTokens     int          `json:"prompt_tokens"`
+	CompletionTokens int          `json:"completion_tokens"`
+	TotalTokens      int          `json:"total_tokens"`
+	PlanType         string       `json:"plan_type,omitempty"`
+	DailyQuota       *UsageQuota  `json:"daily_quota,omitempty"`
+	WeeklyQuota      *UsageQuota  `json:"weekly_quota,omitempty"`
+	OtherQuotas      []UsageQuota `json:"other_quotas,omitempty"`
+}
+
+// ContextUsageProvider is an optional interface for agents that can report
+// token consumption (e.g. Gemini, Claude).
+type ContextUsageProvider interface {
+	GetContextUsage(ctx context.Context, sessionID string) (*ContextUsage, error)
 }
 
 // SessionDeleter is an optional interface for agents that support deleting sessions.

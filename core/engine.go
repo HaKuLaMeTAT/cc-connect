@@ -168,6 +168,9 @@ type Engine struct {
 
 	quietMu sync.RWMutex
 	quiet   bool // when true, suppress thinking and tool progress messages globally
+
+	sendToMu      sync.Mutex
+	sendToHistory map[string][]time.Time
 }
 
 // interactiveState tracks a running interactive agent session and its permission state.
@@ -212,6 +215,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		skills:            NewSkillRegistry(),
 		aliases:           make(map[string]string),
 		interactiveStates: make(map[string]*interactiveState),
+		sendToHistory:     make(map[string][]time.Time),
 		startedAt:         time.Now(),
 		streamPreview:     DefaultStreamPreviewCfg(),
 		eventIdleTimeout:  defaultEventIdleTimeout,
@@ -1162,10 +1166,17 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				slog.Debug("EventResult: finalized via stream preview", "response_len", len(fullResponse))
 			} else {
 				slog.Debug("EventResult: sending via p.Send (preview inactive or failed)", "response_len", len(fullResponse), "chunks", len(splitMessage(fullResponse, maxPlatformMessageLen)))
-				for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
-					if err := p.Send(e.ctx, replyCtx, chunk); err != nil {
-						slog.Error("failed to send reply", "error", err, "msg_id", msgID)
+				if gs, ok := p.(GroupedMessageSender); ok {
+					if err := gs.SendGrouped(e.ctx, replyCtx, fullResponse); err != nil {
+						slog.Error("failed to send grouped reply", "error", err, "msg_id", msgID)
 						return
+					}
+				} else {
+					for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
+						if err := p.Send(e.ctx, replyCtx, chunk); err != nil {
+							slog.Error("failed to send reply", "error", err, "msg_id", msgID)
+							return
+						}
 					}
 				}
 			}
@@ -1214,8 +1225,14 @@ channelClosed:
 		if sp.finish(fullResponse) {
 			slog.Debug("stream preview: finalized in-place (process exited)")
 		} else {
-			for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
-				e.send(p, replyCtx, chunk)
+			if gs, ok := p.(GroupedMessageSender); ok {
+				if err := gs.SendGrouped(e.ctx, replyCtx, fullResponse); err != nil {
+					slog.Error("failed to send grouped reply after process exit", "error", err)
+				}
+			} else {
+				for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
+					e.send(p, replyCtx, chunk)
+				}
 			}
 		}
 	}
@@ -1263,6 +1280,8 @@ var builtinCommands = []struct {
 	{[]string{"search", "find"}, "search"},
 	{[]string{"shell", "sh", "exec", "run"}, "shell"},
 	{[]string{"tts"}, "tts"},
+	{[]string{"usage", "tokens", "token"}, "usage"},
+	{[]string{"sendto", "quote"}, "sendto"},
 }
 
 // matchPrefix finds a unique command matching the given prefix.
@@ -1394,6 +1413,10 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdShell(p, msg, raw)
 	case "tts":
 		e.cmdTTS(p, msg, args)
+	case "usage":
+		e.cmdUsage(p, msg)
+	case "sendto":
+		e.cmdSendTo(p, msg, args)
 	default:
 		if custom, ok := e.commands.Resolve(cmd); ok {
 			e.executeCustomCommand(p, msg, custom, args)
@@ -1806,6 +1829,181 @@ func (e *Engine) cmdCurrent(p Platform, msg *Message) {
 	}
 
 	e.replyWithCard(p, msg.ReplyCtx, e.renderCurrentCard(msg.SessionKey))
+}
+
+func (e *Engine) cmdUsage(p Platform, msg *Message) {
+	s := e.sessions.GetOrCreateActive(msg.SessionKey)
+	agentID := s.AgentSessionID
+	if agentID == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgUsageNoSession))
+		return
+	}
+
+	up, ok := e.agent.(ContextUsageProvider)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgUsageNotSupported))
+		return
+	}
+
+	usage, err := up.GetContextUsage(e.ctx, agentID)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+		return
+	}
+
+	if usage == nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgUsageNotSupported))
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(e.i18n.T(MsgUsageTitle) + "\n\n")
+
+	if usage.PlanType != "" {
+		sb.WriteString(fmt.Sprintf("• %s: **%s**\n\n", e.i18n.T(MsgUsagePlan), usage.PlanType))
+	}
+
+	sb.WriteString(fmt.Sprintf("• %s: **%d**\n", e.i18n.T(MsgUsagePrompt), usage.PromptTokens))
+	sb.WriteString(fmt.Sprintf("• %s: **%d**\n", e.i18n.T(MsgUsageCompletion), usage.CompletionTokens))
+	sb.WriteString(fmt.Sprintf("• %s: **%d**\n", e.i18n.T(MsgUsageTotal), usage.TotalTokens))
+
+	if usage.DailyQuota != nil {
+		sb.WriteString("\n" + e.renderQuota(e.i18n.T(MsgUsageDaily), usage.DailyQuota))
+	}
+	if usage.WeeklyQuota != nil {
+		sb.WriteString("\n" + e.renderQuota(e.i18n.T(MsgUsageWeekly), usage.WeeklyQuota))
+	}
+	for _, q := range usage.OtherQuotas {
+		label := q.Label
+		if label == "" {
+			label = "Quota"
+		}
+		sb.WriteString("\n" + e.renderQuota(label, &q))
+	}
+
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+func (e *Engine) cmdSendTo(p Platform, msg *Message, args []string) {
+	if !e.allowSendTo(msg.SessionKey) {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSendToRateLimited))
+		return
+	}
+
+	if msg.ReplyToMessageID == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSendToNoReply))
+		return
+	}
+
+	resolver, ok := p.(ReplyTextResolver)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSendToNotSupported))
+		return
+	}
+
+	replyText, ok := resolver.ResolveReplyText(msg.ReplyCtx, msg.ReplyToMessageID)
+	if !ok {
+		replyText = strings.TrimSpace(msg.ReplyToContent)
+	}
+	if strings.TrimSpace(replyText) == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSendToResolveFailed))
+		return
+	}
+
+	forwarded := *msg
+	forwarded.Content = buildSendToPrompt(replyText, strings.TrimSpace(strings.Join(args, " ")))
+	forwarded.ReplyToMessageID = ""
+	forwarded.ReplyToContent = ""
+	forwarded.Images = nil
+	forwarded.Audio = nil
+	e.handleMessage(p, &forwarded)
+}
+
+const sendToWindow = time.Minute
+const sendToMaxPerWindow = 4
+
+func (e *Engine) allowSendTo(sessionKey string) bool {
+	key := sessionKey
+	if platform, chatID, err := parseSessionKeyParts(sessionKey); err == nil {
+		key = platform + ":" + chatID
+	}
+
+	now := time.Now()
+	cutoff := now.Add(-sendToWindow)
+
+	e.sendToMu.Lock()
+	defer e.sendToMu.Unlock()
+
+	history := e.sendToHistory[key]
+	kept := history[:0]
+	for _, ts := range history {
+		if ts.After(cutoff) {
+			kept = append(kept, ts)
+		}
+	}
+	if len(kept) >= sendToMaxPerWindow {
+		e.sendToHistory[key] = kept
+		return false
+	}
+	kept = append(kept, now)
+	e.sendToHistory[key] = kept
+	return true
+}
+
+func buildSendToPrompt(replyText, instruction string) string {
+	replyText = strings.TrimSpace(replyText)
+	instruction = strings.TrimSpace(instruction)
+	if instruction == "" {
+		return "Forwarded message:\n\n" + replyText
+	}
+	return "Forwarded message:\n\n" + replyText + "\n\nUser request:\n" + instruction
+}
+
+func (e *Engine) renderQuota(label string, q *UsageQuota) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("• %s: **%.1f%%** %s\n", label, q.UsedPercent, e.usageProgressBar(q.UsedPercent)))
+
+	if !q.ResetsAt.IsZero() {
+		timeLeft := time.Until(q.ResetsAt)
+		if timeLeft > 0 {
+			sb.WriteString(fmt.Sprintf("  └ %s: **%s**\n", e.i18n.T(MsgUsageResetsIn), formatDurationI18n(timeLeft, e.i18n.CurrentLang())))
+		} else {
+			sb.WriteString(fmt.Sprintf("  └ %s: **%s**\n", e.i18n.T(MsgUsageResetsAt), q.ResetsAt.Format("01-02 15:04")))
+		}
+	}
+	return sb.String()
+}
+
+func (e *Engine) usageProgressBar(percent float64) string {
+	const width = 10
+	filled := int(percent / 10)
+	if filled > width {
+		filled = width
+	}
+	if filled < 0 {
+		filled = 0
+	}
+	return strings.Repeat("■", filled) + strings.Repeat("□", width-filled)
+}
+
+func formatUsagePercent(v float64) string {
+	if v == float64(int64(v)) {
+		return fmt.Sprintf("%.0f", v)
+	}
+	return fmt.Sprintf("%.1f", v)
+}
+
+func formatUsageWindow(minutes int) string {
+	switch {
+	case minutes%10080 == 0:
+		return fmt.Sprintf("%dw", minutes/10080)
+	case minutes%1440 == 0:
+		return fmt.Sprintf("%dd", minutes/1440)
+	case minutes%60 == 0:
+		return fmt.Sprintf("%dh", minutes/60)
+	default:
+		return fmt.Sprintf("%dm", minutes)
+	}
 }
 
 func (e *Engine) cmdStatus(p Platform, msg *Message) {
@@ -2418,6 +2616,14 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 				sb.WriteString(e.i18n.Tf(MsgModelCurrent, current))
 				sb.WriteString("\n")
 			}
+			if rs, ok := e.agent.(ReasoningEffortSwitcher); ok {
+				if effort := rs.GetReasoningEffort(); effort == "" {
+					sb.WriteString(e.i18n.T(MsgReasoningDefault))
+				} else {
+					sb.WriteString(e.i18n.Tf(MsgReasoningCurrent, effort))
+				}
+				sb.WriteString("\n")
+			}
 			sb.WriteString("\n")
 			sb.WriteString(e.i18n.T(MsgModelListTitle))
 			var buttons [][]ButtonOption
@@ -2445,6 +2651,11 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 			}
 			if len(row) > 0 {
 				buttons = append(buttons, row)
+			}
+			if _, ok := e.agent.(ReasoningEffortSwitcher); ok {
+				buttons = append(buttons, []ButtonOption{
+					{Text: e.i18n.T(MsgCardTitleReasoning), Data: "cmd:/reasoning"},
+				})
 			}
 			sb.WriteString("\n")
 			sb.WriteString(e.i18n.T(MsgModelUsage))
@@ -3569,6 +3780,14 @@ func (e *Engine) renderModelCard() *Card {
 	} else {
 		sb.WriteString(e.i18n.Tf(MsgModelCurrent, current))
 	}
+	if rs, ok := e.agent.(ReasoningEffortSwitcher); ok {
+		sb.WriteString("\n")
+		if effort := rs.GetReasoningEffort(); effort == "" {
+			sb.WriteString(e.i18n.T(MsgReasoningDefault))
+		} else {
+			sb.WriteString(e.i18n.Tf(MsgReasoningCurrent, effort))
+		}
+	}
 
 	var opts []CardSelectOption
 	initVal := ""
@@ -3586,8 +3805,12 @@ func (e *Engine) renderModelCard() *Card {
 
 	cb := NewCard().Title(e.i18n.T(MsgCardTitleModel), "indigo").
 		Markdown(sb.String()).
-		Select(e.i18n.T(MsgModelSelectPlaceholder), opts, initVal).
-		Buttons(e.cardBackButton())
+		Select(e.i18n.T(MsgModelSelectPlaceholder), opts, initVal)
+	if _, ok := e.agent.(ReasoningEffortSwitcher); ok {
+		cb.Buttons(DefaultBtn(e.i18n.T(MsgCardTitleReasoning), "nav:/reasoning"), e.cardBackButton())
+	} else {
+		cb.Buttons(e.cardBackButton())
+	}
 	cb.Note(e.i18n.T(MsgModelUsage))
 	return cb.Build()
 }

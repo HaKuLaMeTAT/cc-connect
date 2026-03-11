@@ -57,6 +57,18 @@ func (p *stubInlineButtonPlatform) SendWithButtons(_ context.Context, _ any, con
 	return nil
 }
 
+type stubReplyResolverPlatform struct {
+	stubPlatformEngine
+	replyText string
+}
+
+func (p *stubReplyResolverPlatform) ResolveReplyText(_ any, _ string) (string, bool) {
+	if p.replyText == "" {
+		return "", false
+	}
+	return p.replyText, true
+}
+
 type stubCardPlatform struct {
 	stubPlatformEngine
 	repliedCards []*Card
@@ -177,6 +189,44 @@ func (a *stubProviderAgent) SetActiveProvider(name string) bool {
 	}
 	return false
 }
+
+type stubUsageAgent struct {
+	stubAgent
+	usage *ContextUsage
+	err   error
+}
+
+func (a *stubUsageAgent) GetContextUsage(_ context.Context, _ string) (*ContextUsage, error) {
+	return a.usage, a.err
+}
+
+type stubCaptureAgent struct {
+	stubAgent
+	prompts chan string
+}
+
+func (a *stubCaptureAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
+	ch := make(chan Event, 1)
+	return &stubCaptureSession{prompts: a.prompts, events: ch}, nil
+}
+
+type stubCaptureSession struct {
+	prompts chan string
+	events  chan Event
+}
+
+func (s *stubCaptureSession) Send(prompt string, _ []ImageAttachment) error {
+	s.prompts <- prompt
+	s.events <- Event{Type: EventResult, Content: "ok", SessionID: "capture-session", Done: true}
+	close(s.events)
+	return nil
+}
+
+func (s *stubCaptureSession) RespondPermission(_ string, _ PermissionResult) error { return nil }
+func (s *stubCaptureSession) Events() <-chan Event                                 { return s.events }
+func (s *stubCaptureSession) CurrentSessionID() string                             { return "capture-session" }
+func (s *stubCaptureSession) Alive() bool                                          { return true }
+func (s *stubCaptureSession) Close() error                                         { return nil }
 
 func newTestEngine() *Engine {
 	return NewEngine("test", &stubAgent{}, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
@@ -650,6 +700,29 @@ func TestCmdModel_UsesInlineButtonsOnButtonOnlyPlatform(t *testing.T) {
 	}
 }
 
+func TestCmdModel_IncludesReasoningShortcutOnButtonOnlyPlatform(t *testing.T) {
+	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "inline-only"}}
+	agent := &stubModelModeAgent{reasoningEffort: "high"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	e.cmdModel(p, &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}, nil)
+
+	if !strings.Contains(p.buttonContent, "Current reasoning effort: high") {
+		t.Fatalf("model content = %q, want reasoning summary", p.buttonContent)
+	}
+	found := false
+	for _, row := range p.buttonRows {
+		for _, btn := range row {
+			if btn.Data == "cmd:/reasoning" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("button rows = %#v, want cmd:/reasoning shortcut", p.buttonRows)
+	}
+}
+
 func TestCmdReasoning_UsesInlineButtonsOnButtonOnlyPlatform(t *testing.T) {
 	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "inline-only"}}
 	agent := &stubModelModeAgent{}
@@ -665,6 +738,23 @@ func TestCmdReasoning_UsesInlineButtonsOnButtonOnlyPlatform(t *testing.T) {
 	}
 	if got := p.buttonRows[0][0].Text; got != "low" {
 		t.Fatalf("first /reasoning button text = %q, want low", got)
+	}
+}
+
+func TestRenderModelCard_IncludesReasoningShortcut(t *testing.T) {
+	agent := &stubModelModeAgent{model: "gpt-4.1", reasoningEffort: "medium"}
+	e := NewEngine("test", agent, []Platform{&stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "card"}}}, "", LangEnglish)
+
+	card := e.renderModelCard()
+	text := card.RenderText()
+	if !strings.Contains(text, "Current model: gpt-4.1") {
+		t.Fatalf("card text = %q, want current model", text)
+	}
+	if !strings.Contains(text, "Current reasoning effort: medium") {
+		t.Fatalf("card text = %q, want reasoning summary", text)
+	}
+	if _, ok := findCardAction(card, "nav:/reasoning"); !ok {
+		t.Fatalf("card actions missing nav:/reasoning: %#v", card.Elements)
 	}
 }
 
@@ -740,6 +830,148 @@ func TestCmdStatus_UsesLegacyTextOnPlatformWithoutCardSupport(t *testing.T) {
 	}
 	if strings.Contains(p.sent[0], "[← Back]") {
 		t.Fatalf("status text = %q, should not be card fallback text", p.sent[0])
+	}
+}
+
+func TestCmdUsage_ShowsTokenUsage(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubUsageAgent{
+		usage: &ContextUsage{PromptTokens: 12, CompletionTokens: 3, TotalTokens: 15},
+	}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+
+	s := e.sessions.GetOrCreateActive(msg.SessionKey)
+	s.AgentSessionID = "usage-session"
+
+	e.cmdUsage(p, msg)
+
+	if len(p.sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(p.sent))
+	}
+	if !strings.Contains(p.sent[0], "Input: **12**") || !strings.Contains(p.sent[0], "Output: **3**") || !strings.Contains(p.sent[0], "Total: **15**") {
+		t.Fatalf("usage text = %q, want token usage lines", p.sent[0])
+	}
+}
+
+func TestCmdUsage_ShowsQuotaDetailsWhenAvailable(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubUsageAgent{
+		usage: &ContextUsage{
+			PromptTokens:     100,
+			CompletionTokens: 20,
+			TotalTokens:      120,
+			PlanType:         "plus",
+			DailyQuota: &UsageQuota{
+				UsedPercent:   2,
+				WindowMinutes: 300,
+				ResetsAt:      time.Date(2026, 3, 11, 21, 29, 0, 0, time.Local),
+			},
+			WeeklyQuota: &UsageQuota{
+				UsedPercent:   3,
+				WindowMinutes: 10080,
+				ResetsAt:      time.Date(2026, 3, 18, 8, 0, 0, 0, time.Local),
+			},
+		},
+	}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "test:user2", ReplyCtx: "ctx"}
+
+	s := e.sessions.GetOrCreateActive(msg.SessionKey)
+	s.AgentSessionID = "usage-session"
+
+	e.cmdUsage(p, msg)
+
+	if len(p.sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(p.sent))
+	}
+	if !strings.Contains(p.sent[0], "Plan: **plus**") {
+		t.Fatalf("usage text = %q, want plan line", p.sent[0])
+	}
+	if !strings.Contains(p.sent[0], "Daily Quota: **2.0%**") || !strings.Contains(p.sent[0], "Resets in: **") {
+		t.Fatalf("usage text = %q, want daily quota line", p.sent[0])
+	}
+	if !strings.Contains(p.sent[0], "Weekly Quota: **3.0%**") || !strings.Contains(p.sent[0], "□□□□") {
+		t.Fatalf("usage text = %q, want weekly quota line", p.sent[0])
+	}
+}
+
+func TestBuildSendToPrompt(t *testing.T) {
+	got := buildSendToPrompt("alpha", "please summarize")
+	if !strings.Contains(got, "Forwarded message:\n\nalpha") || !strings.Contains(got, "User request:\nplease summarize") {
+		t.Fatalf("prompt = %q, want forwarded message + user request", got)
+	}
+}
+
+func TestCmdSendTo_ForwardsResolvedReplyText(t *testing.T) {
+	p := &stubReplyResolverPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "plain"},
+		replyText:          "full assistant reply",
+	}
+	agent := &stubCaptureAgent{prompts: make(chan string, 1)}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{
+		SessionKey:       "test:user-sendto",
+		ReplyCtx:         "ctx",
+		ReplyToMessageID: "42",
+		Content:          "/sendto summarize this",
+	}
+
+	e.cmdSendTo(p, msg, []string{"summarize this"})
+
+	select {
+	case prompt := <-agent.prompts:
+		if !strings.Contains(prompt, "Forwarded message:\n\nfull assistant reply") {
+			t.Fatalf("prompt = %q, want forwarded reply text", prompt)
+		}
+		if !strings.Contains(prompt, "User request:\nsummarize this") {
+			t.Fatalf("prompt = %q, want appended user request", prompt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for forwarded prompt")
+	}
+}
+
+func TestCmdSendTo_RequiresReply(t *testing.T) {
+	p := &stubReplyResolverPlatform{stubPlatformEngine: stubPlatformEngine{n: "plain"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "test:user-sendto", ReplyCtx: "ctx"}
+
+	e.cmdSendTo(p, msg, nil)
+
+	if len(p.sent) != 1 || !strings.Contains(p.sent[0], "Reply to a bot message first") {
+		t.Fatalf("sent = %v, want reply requirement", p.sent)
+	}
+}
+
+func TestCmdSendTo_RateLimitedPerChat(t *testing.T) {
+	p := &stubReplyResolverPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "plain"},
+		replyText:          "full assistant reply",
+	}
+	agent := &stubCaptureAgent{prompts: make(chan string, 8)}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	for i := 0; i < sendToMaxPerWindow; i++ {
+		msg := &Message{
+			SessionKey:       "telegram:123:456",
+			ReplyCtx:         "ctx",
+			ReplyToMessageID: "42",
+			Content:          "/sendto ping",
+		}
+		e.cmdSendTo(p, msg, []string{"ping"})
+	}
+
+	msg := &Message{
+		SessionKey:       "telegram:123:789",
+		ReplyCtx:         "ctx",
+		ReplyToMessageID: "42",
+		Content:          "/sendto ping",
+	}
+	e.cmdSendTo(p, msg, []string{"ping"})
+
+	if len(p.sent) == 0 || !strings.Contains(p.sent[len(p.sent)-1], "Too many `/sendto` requests") {
+		t.Fatalf("sent = %v, want rate limit message", p.sent)
 	}
 }
 

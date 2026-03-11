@@ -172,6 +172,19 @@ func findSessionFile(sessionID string) string {
 	}
 	sessionsDir := filepath.Join(codexHome, "sessions")
 
+	patterns := []string{
+		filepath.Join(sessionsDir, "*"+sessionID+"*.jsonl"),
+		filepath.Join(sessionsDir, "*", "*", "*", "*"+sessionID+"*.jsonl"),
+	}
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil || len(matches) == 0 {
+			continue
+		}
+		sort.Strings(matches)
+		return matches[0]
+	}
+
 	var found string
 	_ = filepath.Walk(sessionsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || found != "" {
@@ -183,6 +196,194 @@ func findSessionFile(sessionID string) string {
 		return nil
 	})
 	return found
+}
+
+func getCodexContextUsage(sessionID string) (*core.ContextUsage, error) {
+	path := findSessionFile(sessionID)
+	if path == "" {
+		return nil, fmt.Errorf("session file not found for %s", sessionID)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	usage := &core.ContextUsage{}
+	var lastRateLimits *codexRateLimits
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 256*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+
+		var raw struct {
+			Type    string          `json:"type"`
+			Payload json.RawMessage `json:"payload"`
+		}
+		if json.Unmarshal([]byte(line), &raw) != nil || raw.Type != "event_msg" {
+			continue
+		}
+
+		var payload struct {
+			Type string `json:"type"`
+			Info struct {
+				LastTokenUsage  map[string]any `json:"last_token_usage"`
+				TotalTokenUsage map[string]any `json:"total_token_usage"`
+			} `json:"info"`
+			RateLimits *codexRateLimits `json:"rate_limits"`
+		}
+		if json.Unmarshal(raw.Payload, &payload) != nil || payload.Type != "token_count" {
+			continue
+		}
+		tokens := payload.Info.LastTokenUsage
+		if len(tokens) == 0 {
+			tokens = payload.Info.TotalTokenUsage
+		}
+		if len(tokens) == 0 {
+			continue
+		}
+
+		usage = usageFromTokenMap(tokens)
+		if payload.RateLimits != nil {
+			lastRateLimits = payload.RateLimits
+		}
+		applyCodexRateLimits(usage, lastRateLimits)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return usage, nil
+}
+
+type codexRateLimits struct {
+	Primary   *codexRateLimitWindow `json:"primary"`
+	Secondary *codexRateLimitWindow `json:"secondary"`
+	PlanType  string                `json:"plan_type"`
+}
+
+type codexRateLimitWindow struct {
+	UsedPercent   float64 `json:"used_percent"`
+	WindowMinutes int     `json:"window_minutes"`
+	ResetsAt      int64   `json:"resets_at"`
+}
+
+func usageFromTokenMap(tokens map[string]any) *core.ContextUsage {
+	if tokens == nil {
+		return &core.ContextUsage{}
+	}
+
+	usage := &core.ContextUsage{
+		PromptTokens:     tokenMapInt(tokens, "prompt_tokens", "input_tokens", "inputTokens"),
+		CompletionTokens: tokenMapInt(tokens, "completion_tokens", "output_tokens", "outputTokens"),
+		TotalTokens:      tokenMapInt(tokens, "total_tokens", "totalTokens"),
+	}
+	if usage.TotalTokens == 0 {
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}
+	return usage
+}
+
+func tokenMapInt(tokens map[string]any, keys ...string) int {
+	for _, key := range keys {
+		v, ok := tokens[key]
+		if !ok {
+			continue
+		}
+		switch n := v.(type) {
+		case float64:
+			return int(n)
+		case float32:
+			return int(n)
+		case int:
+			return n
+		case int64:
+			return int(n)
+		case json.Number:
+			i, err := n.Int64()
+			if err == nil {
+				return int(i)
+			}
+		}
+	}
+	return 0
+}
+
+func applyCodexRateLimits(usage *core.ContextUsage, limits *codexRateLimits) {
+	if usage == nil || limits == nil {
+		return
+	}
+	if limits.PlanType != "" {
+		usage.PlanType = limits.PlanType
+	}
+
+	windows := make([]core.UsageQuota, 0, 2)
+	if limits.Primary != nil {
+		windows = append(windows, quotaFromCodexWindow("primary", limits.Primary))
+	}
+	if limits.Secondary != nil {
+		windows = append(windows, quotaFromCodexWindow("secondary", limits.Secondary))
+	}
+	if len(windows) == 0 {
+		return
+	}
+
+	dailyIdx := findQuotaByWindow(windows, 18*60, 30*60)
+	weeklyIdx := findQuotaByWindow(windows, 6*24*60, 8*24*60)
+	if dailyIdx < 0 && weeklyIdx >= 0 {
+		for i, quota := range windows {
+			if i == weeklyIdx {
+				continue
+			}
+			if dailyIdx < 0 || quota.WindowMinutes < windows[dailyIdx].WindowMinutes {
+				dailyIdx = i
+			}
+		}
+	}
+
+	used := make(map[int]struct{}, 2)
+	if dailyIdx >= 0 {
+		usage.DailyQuota = &windows[dailyIdx]
+		used[dailyIdx] = struct{}{}
+	}
+	if weeklyIdx >= 0 {
+		usage.WeeklyQuota = &windows[weeklyIdx]
+		used[weeklyIdx] = struct{}{}
+	}
+	for i, quota := range windows {
+		if _, ok := used[i]; ok {
+			continue
+		}
+		usage.OtherQuotas = append(usage.OtherQuotas, quota)
+	}
+}
+
+func quotaFromCodexWindow(label string, window *codexRateLimitWindow) core.UsageQuota {
+	quota := core.UsageQuota{
+		Label:         label,
+		WindowMinutes: window.WindowMinutes,
+		UsedPercent:   window.UsedPercent,
+	}
+	if window.ResetsAt > 0 {
+		quota.ResetsAt = time.Unix(window.ResetsAt, 0)
+	}
+	return quota
+}
+
+func findQuotaByWindow(quotas []core.UsageQuota, minMinutes, maxMinutes int) int {
+	for i, quota := range quotas {
+		if quota.WindowMinutes >= minMinutes && quota.WindowMinutes <= maxMinutes {
+			return i
+		}
+	}
+	return -1
 }
 
 // getSessionHistory reads the JSONL transcript and returns user/assistant messages.

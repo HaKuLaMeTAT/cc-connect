@@ -38,6 +38,7 @@ type Agent struct {
 	providers  []core.ProviderConfig
 	activeIdx  int
 	sessionEnv []string
+	sessions   map[string]*geminiSession
 	mu         sync.Mutex
 }
 
@@ -74,6 +75,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		cmd:       cmd,
 		timeout:   timeout,
 		activeIdx: -1,
+		sessions:  make(map[string]*geminiSession),
 	}, nil
 }
 
@@ -92,6 +94,8 @@ func normalizeMode(raw string) string {
 
 func (a *Agent) Name() string { return "gemini" }
 
+func (a *Agent) HasSystemPromptSupport() bool { return true }
+
 func (a *Agent) SetModel(model string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -106,13 +110,28 @@ func (a *Agent) GetModel() string {
 }
 
 func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
-	if models := a.fetchModelsFromAPI(ctx); len(models) > 0 {
+	models := mergeGeminiModelOptions(
+		a.fetchModelsFromAPI(ctx),
+		readGeminiSeenModels(a.workDir),
+		defaultGeminiModels(),
+	)
+	if len(models) > 0 {
 		return models
 	}
+	return defaultGeminiModels()
+}
+
+func defaultGeminiModels() []core.ModelOption {
 	return []core.ModelOption{
 		{Name: "gemini-2.5-pro", Desc: "Gemini 2.5 Pro (most capable)"},
 		{Name: "gemini-2.5-flash", Desc: "Gemini 2.5 Flash (fast)"},
+		{Name: "gemini-2.5-flash-lite", Desc: "Gemini 2.5 Flash Lite"},
 		{Name: "gemini-2.0-flash", Desc: "Gemini 2.0 Flash (lightweight)"},
+		{Name: "gemini-2.0-flash-lite", Desc: "Gemini 2.0 Flash Lite"},
+		{Name: "gemini-1.5-pro", Desc: "Gemini 1.5 Pro"},
+		{Name: "gemini-1.5-flash", Desc: "Gemini 1.5 Flash"},
+		{Name: "gemini-3-flash-preview", Desc: "Gemini 3 Flash Preview"},
+		{Name: "gemini-3.1-pro-preview", Desc: "Gemini 3.1 Pro Preview"},
 	}
 }
 
@@ -164,6 +183,87 @@ func (a *Agent) fetchModelsFromAPI(ctx context.Context) []core.ModelOption {
 	return models
 }
 
+func readGeminiSeenModels(workDir string) []core.ModelOption {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+
+	projName := geminiProjectHash(workDir)
+	chatsDir := filepath.Join(homeDir, ".gemini", "tmp", projName, "chats")
+	entries, err := os.ReadDir(chatsDir)
+	if err != nil {
+		return nil
+	}
+
+	var models []core.ModelOption
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(chatsDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var sf sessionFile
+		if json.Unmarshal(data, &sf) != nil {
+			continue
+		}
+		for _, msg := range sf.Messages {
+			if strings.TrimSpace(msg.Model) == "" {
+				continue
+			}
+			models = append(models, core.ModelOption{Name: msg.Model})
+		}
+	}
+
+	if settingsModel := readGeminiConfiguredModel(); settingsModel != "" {
+		models = append(models, core.ModelOption{Name: settingsModel})
+	}
+	return models
+}
+
+func readGeminiConfiguredModel() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	path := filepath.Join(homeDir, ".gemini", "settings.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var cfg struct {
+		Model struct {
+			Name string `json:"name"`
+		} `json:"model"`
+	}
+	if json.Unmarshal(data, &cfg) != nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.Model.Name)
+}
+
+func mergeGeminiModelOptions(groups ...[]core.ModelOption) []core.ModelOption {
+	seen := make(map[string]struct{})
+	var merged []core.ModelOption
+	for _, group := range groups {
+		for _, model := range group {
+			name := strings.TrimSpace(model.Name)
+			if name == "" || !strings.HasPrefix(name, "gemini-") {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			model.Name = name
+			merged = append(merged, model)
+		}
+	}
+	return merged
+}
+
 func (a *Agent) SetSessionEnv(env []string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -186,12 +286,116 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 	a.mu.Unlock()
 
-	return newGeminiSession(ctx, cmd, workDir, model, mode, sessionID, extraEnv, timeout)
+	gs, err := newGeminiSession(ctx, cmd, workDir, model, mode, sessionID, extraEnv, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	a.mu.Lock()
+	a.sessions[sessionID] = gs
+	a.mu.Unlock()
+
+	return gs, nil
+}
+
+func (a *Agent) GetContextUsage(_ context.Context, sessionID string) (*core.ContextUsage, error) {
+	a.mu.Lock()
+	gs, ok := a.sessions[sessionID]
+	if !ok || gs == nil {
+		for key, sess := range a.sessions {
+			if sess == nil {
+				continue
+			}
+			if sess.CurrentSessionID() == sessionID {
+				gs = sess
+				ok = true
+				if key != sessionID {
+					a.sessions[sessionID] = sess
+				}
+				break
+			}
+		}
+	}
+	a.mu.Unlock()
+
+	if ok && gs != nil {
+		u := gs.usage.Load()
+		if u != nil {
+			return u, nil
+		}
+	}
+
+	u, err := getGeminiContextUsage(a.workDir, sessionID)
+	if err == nil {
+		return u, nil
+	}
+	if ok && gs != nil {
+		return &core.ContextUsage{}, nil
+	}
+	return nil, fmt.Errorf("session not active: %s", sessionID)
 }
 
 // ListSessions reads sessions from ~/.gemini/tmp/<project_hash>/chats/.
 func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
 	return listGeminiSessions(a.workDir)
+}
+
+func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int) ([]core.HistoryEntry, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("gemini: cannot determine home dir: %w", err)
+	}
+
+	projName := geminiProjectHash(a.workDir)
+	path := filepath.Join(homeDir, ".gemini", "tmp", projName, "chats", sessionID+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("gemini: read session file: %w", err)
+	}
+
+	var sf sessionFile
+	if err := json.Unmarshal(data, &sf); err != nil {
+		return nil, fmt.Errorf("gemini: unmarshal session file: %w", err)
+	}
+
+	var history []core.HistoryEntry
+	for _, msg := range sf.Messages {
+		if msg.Type != "user" && msg.Type != "assistant" {
+			continue
+		}
+
+		var content strings.Builder
+		for _, c := range msg.Content {
+			if c.Text != "" {
+				if content.Len() > 0 {
+					content.WriteString("\n")
+				}
+				content.WriteString(c.Text)
+			}
+		}
+
+		role := msg.Type
+		if role == "" {
+			continue
+		}
+
+		history = append(history, core.HistoryEntry{
+			Role:    role,
+			Content: content.String(),
+			// Gemini CLI JSON doesn't store per-message timestamps,
+			// using session LastUpdated as a fallback if needed, but HistoryEntry
+			// doesn't strictly require it for display.
+		})
+	}
+
+	if limit > 0 && len(history) > limit {
+		history = history[len(history)-limit:]
+	}
+
+	return history, nil
 }
 
 func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
@@ -361,12 +565,48 @@ type sessionFile struct {
 	StartTime   time.Time `json:"startTime"`
 	LastUpdated time.Time `json:"lastUpdated"`
 	Messages    []struct {
-		Type    string `json:"type"`
+		Type   string `json:"type"`
+		Model  string `json:"model"`
+		Tokens *struct {
+			Input  int `json:"input"`
+			Output int `json:"output"`
+			Total  int `json:"total"`
+		} `json:"tokens"`
 		Content []struct {
 			Text string `json:"text"`
 		} `json:"content"`
 	} `json:"messages"`
 	Kind string `json:"kind"`
+}
+
+func getGeminiContextUsage(workDir, sessionID string) (*core.ContextUsage, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("gemini: cannot determine home dir: %w", err)
+	}
+
+	projName := geminiProjectHash(workDir)
+	path := filepath.Join(homeDir, ".gemini", "tmp", projName, "chats", sessionID+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("gemini: read session file: %w", err)
+	}
+
+	var sf sessionFile
+	if err := json.Unmarshal(data, &sf); err != nil {
+		return nil, fmt.Errorf("gemini: unmarshal session file: %w", err)
+	}
+
+	usage := &core.ContextUsage{}
+	for _, msg := range sf.Messages {
+		if msg.Type != "assistant" || msg.Tokens == nil {
+			continue
+		}
+		usage.PromptTokens = msg.Tokens.Input
+		usage.CompletionTokens = msg.Tokens.Output
+		usage.TotalTokens = msg.Tokens.Total
+	}
+	return usage, nil
 }
 
 func listGeminiSessions(workDir string) ([]core.AgentSessionInfo, error) {

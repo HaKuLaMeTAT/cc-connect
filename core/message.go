@@ -58,16 +58,18 @@ type AudioAttachment struct {
 
 // Message represents a unified incoming message from any platform.
 type Message struct {
-	SessionKey string // unique key for user context, e.g. "feishu:{chatID}:{userID}"
-	Platform   string
-	MessageID  string // platform message ID for tracing
-	UserID     string
-	UserName   string
-	Content    string
-	Images     []ImageAttachment // attached images (if any)
-	Audio      *AudioAttachment  // voice message (if any)
-	ReplyCtx   any               // platform-specific context needed for replying
-	FromVoice  bool              // true if message originated from voice transcription
+	SessionKey       string // unique key for user context, e.g. "feishu:{chatID}:{userID}"
+	Platform         string
+	MessageID        string // platform message ID for tracing
+	UserID           string
+	UserName         string
+	Content          string
+	ReplyToMessageID string            // platform message id this message replies to (if any)
+	ReplyToContent   string            // raw replied message content if the platform exposes it
+	Images           []ImageAttachment // attached images (if any)
+	Audio            *AudioAttachment  // voice message (if any)
+	ReplyCtx         any               // platform-specific context needed for replying
+	FromVoice        bool              // true if message originated from voice transcription
 }
 
 // EventType distinguishes different kinds of agent output.

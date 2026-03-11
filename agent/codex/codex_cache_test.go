@@ -19,6 +19,7 @@ func TestAvailableModels_FallbackToModelsCache(t *testing.T) {
   "models": [
     {"slug":"gpt-5.4","description":"Latest frontier agentic coding model.","visibility":"list","supported_in_api":true},
     {"slug":"gpt-5.3-codex","description":"Great for coding","visibility":"list","supported_in_api":true},
+    {"slug":"gpt-5","description":"Hidden but supported","visibility":"hide","supported_in_api":true},
     {"slug":"hidden-internal","visibility":"hidden","supported_in_api":true},
     {"slug":"tool-only","visibility":"list","supported_in_api":false}
   ]
@@ -33,11 +34,14 @@ func TestAvailableModels_FallbackToModelsCache(t *testing.T) {
 
 	a := &Agent{activeIdx: -1}
 	models := a.AvailableModels(context.Background())
-	if len(models) != 2 {
-		t.Fatalf("models length = %d, want 2, models=%v", len(models), models)
+
+	names := make(map[string]struct{}, len(models))
+	for _, m := range models {
+		names[m.Name] = struct{}{}
 	}
-	if models[0].Name != "gpt-5.4" || models[1].Name != "gpt-5.3-codex" {
-		t.Fatalf("models = %v, want [gpt-5.4 gpt-5.3-codex]", models)
+	for _, want := range []string{"gpt-5", "gpt-5.3-codex", "gpt-5.4"} {
+		if _, ok := names[want]; !ok {
+			t.Fatalf("models missing %q: %v", want, models)
+		}
 	}
 }
-

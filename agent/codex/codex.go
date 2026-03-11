@@ -124,13 +124,26 @@ func (a *Agent) AvailableReasoningEfforts() []string {
 }
 
 func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
-	if models := a.fetchModelsFromAPI(ctx); len(models) > 0 {
+	models := mergeModelOptions(
+		a.fetchModelsFromAPI(ctx),
+		readCodexCachedModels(),
+		defaultCodexModels(),
+	)
+	if len(models) > 0 {
 		return models
 	}
-	if models := readCodexCachedModels(); len(models) > 0 {
-		return models
-	}
+	return defaultCodexModels()
+}
+
+func defaultCodexModels() []core.ModelOption {
 	return []core.ModelOption{
+		{Name: "gpt-5.4", Desc: "GPT-5.4"},
+		{Name: "gpt-5.3-codex", Desc: "GPT-5.3 Codex"},
+		{Name: "gpt-5.2-codex", Desc: "GPT-5.2 Codex"},
+		{Name: "gpt-5.2", Desc: "GPT-5.2"},
+		{Name: "gpt-5.1-codex-max", Desc: "GPT-5.1 Codex Max"},
+		{Name: "gpt-5.1-codex-mini", Desc: "GPT-5.1 Codex Mini"},
+		{Name: "gpt-5", Desc: "GPT-5"},
 		{Name: "o4-mini", Desc: "O4 Mini (fast reasoning)"},
 		{Name: "o3", Desc: "O3 (most capable reasoning)"},
 		{Name: "gpt-4.1", Desc: "GPT-4.1 (balanced)"},
@@ -138,13 +151,6 @@ func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 		{Name: "gpt-4.1-nano", Desc: "GPT-4.1 Nano (fastest)"},
 		{Name: "codex-mini-latest", Desc: "Codex Mini (code-optimized)"},
 	}
-}
-
-var openaiChatModels = map[string]bool{
-	"o4-mini": true, "o3": true, "o3-mini": true, "o1": true, "o1-mini": true,
-	"gpt-4.1": true, "gpt-4.1-mini": true, "gpt-4.1-nano": true,
-	"gpt-4o": true, "gpt-4o-mini": true,
-	"codex-mini-latest": true,
 }
 
 func (a *Agent) fetchModelsFromAPI(ctx context.Context) []core.ModelOption {
@@ -198,7 +204,7 @@ func (a *Agent) fetchModelsFromAPI(ctx context.Context) []core.ModelOption {
 
 	var models []core.ModelOption
 	for _, m := range result.Data {
-		if openaiChatModels[m.ID] {
+		if isLikelyCodexModel(m.ID) {
 			models = append(models, core.ModelOption{Name: m.ID})
 		}
 	}
@@ -243,10 +249,10 @@ func readCodexCachedModels() []core.ModelOption {
 		if name == "" {
 			continue
 		}
-		if m.Visibility != "" && m.Visibility != "list" {
+		if !m.SupportedInAPI {
 			continue
 		}
-		if !m.SupportedInAPI {
+		if !isLikelyCodexModel(name) {
 			continue
 		}
 		if _, ok := seen[name]; ok {
@@ -259,6 +265,45 @@ func readCodexCachedModels() []core.ModelOption {
 		})
 	}
 	return models
+}
+
+func isLikelyCodexModel(id string) bool {
+	id = strings.TrimSpace(strings.ToLower(id))
+	if id == "" {
+		return false
+	}
+	for _, banned := range []string{
+		"embedding", "moderation", "transcribe", "tts", "realtime", "audio", "vision",
+		"search", "image", "whisper", "omni-",
+	} {
+		if strings.Contains(id, banned) || strings.HasPrefix(id, banned) {
+			return false
+		}
+	}
+	return strings.HasPrefix(id, "gpt-") ||
+		strings.HasPrefix(id, "o") ||
+		strings.HasPrefix(id, "codex-") ||
+		strings.Contains(id, "codex")
+}
+
+func mergeModelOptions(groups ...[]core.ModelOption) []core.ModelOption {
+	seen := make(map[string]struct{})
+	var merged []core.ModelOption
+	for _, group := range groups {
+		for _, model := range group {
+			name := strings.TrimSpace(model.Name)
+			if name == "" {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			model.Name = name
+			merged = append(merged, model)
+		}
+	}
+	return merged
 }
 
 func (a *Agent) SetSessionEnv(env []string) {
@@ -282,6 +327,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	a.mu.Unlock()
 
 	return newCodexSession(ctx, a.workDir, model, reasoningEffort, mode, sessionID, extraEnv)
+}
+
+func (a *Agent) GetContextUsage(_ context.Context, sessionID string) (*core.ContextUsage, error) {
+	return getCodexContextUsage(sessionID)
 }
 
 func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {

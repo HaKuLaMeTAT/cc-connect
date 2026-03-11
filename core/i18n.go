@@ -398,6 +398,25 @@ const (
 	MsgBuiltinCmdCompress  MsgKey = "compress"
 	MsgBuiltinCmdStop      MsgKey = "stop"
 	MsgBuiltinCmdCron      MsgKey = "cron"
+	MsgBuiltinCmdUsage     MsgKey = "usage"
+	MsgBuiltinCmdSendTo    MsgKey = "sendto"
+	MsgUsageTitle          MsgKey = "usage_title"
+	MsgUsagePrompt         MsgKey = "usage_prompt"
+	MsgUsageCompletion     MsgKey = "usage_completion"
+	MsgUsageTotal          MsgKey = "usage_total"
+	MsgUsagePlan           MsgKey = "usage_plan"
+	MsgUsageDaily          MsgKey = "usage_daily"
+	MsgUsageWeekly         MsgKey = "usage_weekly"
+	MsgUsageUsed           MsgKey = "usage_used"
+	MsgUsageResetsIn       MsgKey = "usage_resets_in"
+	MsgUsageResetsAt       MsgKey = "usage_resets_at"
+	MsgUsageNotSupported   MsgKey = "usage_not_supported"
+	MsgUsageNoSession      MsgKey = "usage_no_session"
+	MsgSendToUsage         MsgKey = "sendto_usage"
+	MsgSendToNoReply       MsgKey = "sendto_no_reply"
+	MsgSendToResolveFailed MsgKey = "sendto_resolve_failed"
+	MsgSendToNotSupported  MsgKey = "sendto_not_supported"
+	MsgSendToRateLimited   MsgKey = "sendto_rate_limited"
 	MsgBuiltinCmdCommands  MsgKey = "commands"
 	MsgBuiltinCmdAlias     MsgKey = "alias"
 	MsgBuiltinCmdSkills    MsgKey = "skills"
@@ -2458,6 +2477,139 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "管理定時任務，參數: [add|list|del|enable|disable]",
 		LangJapanese:           "スケジュールタスク管理、引数: [add|list|del|enable|disable]",
 		LangSpanish:            "Gestionar tareas programadas, arg: [add|list|del|enable|disable]",
+	},
+	MsgBuiltinCmdUsage: {
+		LangEnglish:            "Show current session token usage",
+		LangChinese:            "显示当前会话 Token 消耗",
+		LangTraditionalChinese: "顯示當前會話 Token 消耗",
+		LangJapanese:           "現在のセッションのトークン使用量を表示",
+		LangSpanish:            "Mostrar el uso de tokens de la sesión actual",
+	},
+	MsgBuiltinCmdSendTo: {
+		LangEnglish:            "Forward a replied bot message to the current bot",
+		LangChinese:            "将回复的机器人消息整条转发给当前机器人",
+		LangTraditionalChinese: "將回覆的機器人訊息整條轉發給當前機器人",
+		LangJapanese:           "返信したボットメッセージ全体を現在のボットへ転送",
+		LangSpanish:            "Reenviar el mensaje respondido de un bot al bot actual",
+	},
+	MsgUsageTitle: {
+		LangEnglish:            "📊 **Session Token Usage**",
+		LangChinese:            "📊 **当前会话 Token 消耗**",
+		LangTraditionalChinese: "📊 **當前會話 Token 消耗**",
+		LangJapanese:           "📊 **セッショントークン使用量**",
+		LangSpanish:            "📊 **Uso de Tokens de la Sesión**",
+	},
+	MsgUsagePrompt: {
+		LangEnglish:            "Input",
+		LangChinese:            "输入",
+		LangTraditionalChinese: "輸入",
+		LangJapanese:           "入力",
+		LangSpanish:            "Entrada",
+	},
+	MsgUsageCompletion: {
+		LangEnglish:            "Output",
+		LangChinese:            "输出",
+		LangTraditionalChinese: "輸出",
+		LangJapanese:           "出力",
+		LangSpanish:            "Salida",
+	},
+	MsgUsageTotal: {
+		LangEnglish:            "Total",
+		LangChinese:            "总计",
+		LangTraditionalChinese: "總計",
+		LangJapanese:           "合計",
+		LangSpanish:            "Total",
+	},
+	MsgUsagePlan: {
+		LangEnglish:            "Plan",
+		LangChinese:            "订阅计划",
+		LangTraditionalChinese: "訂閱計劃",
+		LangJapanese:           "プラン",
+		LangSpanish:            "Plan",
+	},
+	MsgUsageDaily: {
+		LangEnglish:            "Daily Quota",
+		LangChinese:            "每日额度",
+		LangTraditionalChinese: "每日額度",
+		LangJapanese:           "日の制限",
+		LangSpanish:            "Cuota Diaria",
+	},
+	MsgUsageWeekly: {
+		LangEnglish:            "Weekly Quota",
+		LangChinese:            "每周额度",
+		LangTraditionalChinese: "每周額度",
+		LangJapanese:           "週の制限",
+		LangSpanish:            "Cuota Semanal",
+	},
+	MsgUsageUsed: {
+		LangEnglish:            "Used",
+		LangChinese:            "已用",
+		LangTraditionalChinese: "已用",
+		LangJapanese:           "使用済み",
+		LangSpanish:            "Usado",
+	},
+	MsgUsageResetsIn: {
+		LangEnglish:            "Resets in",
+		LangChinese:            "重置倒计时",
+		LangTraditionalChinese: "重置倒計時",
+		LangJapanese:           "リセットまで",
+		LangSpanish:            "Se reinicia en",
+	},
+	MsgUsageResetsAt: {
+		LangEnglish:            "Resets at",
+		LangChinese:            "重置时间",
+		LangTraditionalChinese: "重置時間",
+		LangJapanese:           "リセット時刻",
+		LangSpanish:            "Se reinicia a las",
+	},
+	MsgUsageNotSupported: {
+		LangEnglish:            "Token usage tracking is not supported by the current agent.",
+		LangChinese:            "当前代理不支持 Token 消耗统计。",
+		LangTraditionalChinese: "當前代理不支持 Token 消耗統計。",
+		LangJapanese:           "現在のエージェントはトークン使用量の追跡をサポートしていません。",
+		LangSpanish:            "El seguimiento del uso de tokens no es compatible con el agente actual.",
+	},
+	MsgUsageNoSession: {
+		LangEnglish:            "No active session to show usage for.",
+		LangChinese:            "当前没有活跃会话，无法查看消耗。",
+		LangTraditionalChinese: "當前沒有活躍會話，無法查看消耗。",
+		LangJapanese:           "使用量を表示するアクティブなセッションがありません。",
+		LangSpanish:            "No hay ninguna sesión activa para mostrar el uso.",
+	},
+	MsgSendToUsage: {
+		LangEnglish:            "Usage: reply to a bot message, then send `/sendto [optional instruction]` to the target bot.",
+		LangChinese:            "用法：先回复某个机器人消息，再对目标机器人发送 `/sendto [可选说明]`。",
+		LangTraditionalChinese: "用法：先回覆某個機器人訊息，再對目標機器人傳送 `/sendto [可選說明]`。",
+		LangJapanese:           "使い方: ボットのメッセージに返信してから、対象ボットに `/sendto [任意の指示]` を送信します。",
+		LangSpanish:            "Uso: responde a un mensaje del bot y luego envía `/sendto [instrucción opcional]` al bot de destino.",
+	},
+	MsgSendToNoReply: {
+		LangEnglish:            "Reply to a bot message first, then use `/sendto`.",
+		LangChinese:            "请先回复一条机器人消息，再使用 `/sendto`。",
+		LangTraditionalChinese: "請先回覆一條機器人訊息，再使用 `/sendto`。",
+		LangJapanese:           "先にボットのメッセージへ返信してから `/sendto` を使ってください。",
+		LangSpanish:            "Primero responde a un mensaje del bot y luego usa `/sendto`.",
+	},
+	MsgSendToResolveFailed: {
+		LangEnglish:            "Could not recover the full replied message. Try replying to a newer bot message.",
+		LangChinese:            "无法还原被回复消息的完整内容。请尝试回复更新一点的机器人消息。",
+		LangTraditionalChinese: "無法還原被回覆訊息的完整內容。請嘗試回覆更新一些的機器人訊息。",
+		LangJapanese:           "返信先メッセージの全文を復元できませんでした。もう少し新しいボットメッセージで試してください。",
+		LangSpanish:            "No se pudo recuperar el mensaje completo respondido. Intenta responder a un mensaje más reciente del bot.",
+	},
+	MsgSendToNotSupported: {
+		LangEnglish:            "The current platform cannot resolve replied bot messages.",
+		LangChinese:            "当前平台无法解析被回复的机器人消息。",
+		LangTraditionalChinese: "當前平台無法解析被回覆的機器人訊息。",
+		LangJapanese:           "現在のプラットフォームは返信先のボットメッセージを解析できません。",
+		LangSpanish:            "La plataforma actual no puede resolver mensajes respondidos del bot.",
+	},
+	MsgSendToRateLimited: {
+		LangEnglish:            "Too many `/sendto` requests in this chat. Please wait a minute before trying again.",
+		LangChinese:            "这个群里的 `/sendto` 请求过于频繁，请稍等一分钟再试。",
+		LangTraditionalChinese: "這個群組裡的 `/sendto` 請求過於頻繁，請稍等一分鐘再試。",
+		LangJapanese:           "このチャットでは `/sendto` が多すぎます。1分ほど待ってから再試行してください。",
+		LangSpanish:            "Hay demasiadas solicitudes de `/sendto` en este chat. Espera un minuto antes de volver a intentarlo.",
 	},
 	MsgBuiltinCmdCommands: {
 		LangEnglish:            "Manage custom slash commands, arg: [add|del]",

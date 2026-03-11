@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,7 +37,16 @@ type geminiSession struct {
 	wg       sync.WaitGroup
 	alive    atomic.Bool
 
-	pendingMsgs []string // buffered assistant messages awaiting classification
+	stdin io.WriteCloser
+
+	usage atomic.Pointer[core.ContextUsage]
+
+	turnSeq   atomic.Uint64
+	timerMu   sync.Mutex
+	turnTimer *time.Timer
+
+	tempFilesMu    sync.Mutex
+	pendingBatches [][]string
 }
 
 func newGeminiSession(ctx context.Context, cmd, workDir, model, mode, resumeID string, extraEnv []string, timeout time.Duration) (*geminiSession, error) {
@@ -59,10 +69,87 @@ func newGeminiSession(ctx context.Context, cmd, workDir, model, mode, resumeID s
 		gs.chatID.Store(resumeID)
 	}
 
+	if err := gs.startProcess(); err != nil {
+		cancel()
+		return nil, err
+	}
+
 	return gs, nil
 }
 
-func (gs *geminiSession) Send(prompt string, images []core.ImageAttachment) (err error) {
+func (gs *geminiSession) startProcess() error {
+	args := []string{
+		"--output-format", "stream-json",
+	}
+
+	switch gs.mode {
+	case "yolo":
+		args = append(args, "-y")
+	case "auto_edit":
+		args = append(args, "--approval-mode", "auto_edit")
+	case "plan":
+		args = append(args, "--approval-mode", "plan")
+	}
+
+	if chatID := gs.CurrentSessionID(); chatID != "" {
+		args = append(args, "--resume", chatID)
+	}
+	if gs.model != "" {
+		args = append(args, "-m", gs.model)
+	}
+
+	slog.Debug("geminiSession: launching persistent process", "args", core.RedactArgs(args))
+
+	cmd := exec.CommandContext(gs.ctx, gs.cmd, args...)
+	cmd.Dir = gs.workDir
+	env := os.Environ()
+	if len(gs.extraEnv) > 0 {
+		env = core.MergeEnv(env, gs.extraEnv)
+	}
+	cmd.Env = env
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("geminiSession: stdin pipe: %w", err)
+	}
+	gs.stdin = stdin
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("geminiSession: stdout pipe: %w", err)
+	}
+
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("geminiSession: start: %w", err)
+	}
+
+	gs.wg.Add(1)
+	go func() {
+		defer gs.wg.Done()
+		defer func() {
+			gs.alive.Store(false)
+			if err := cmd.Wait(); err != nil {
+				stderrMsg := strings.TrimSpace(stderrBuf.String())
+				if stderrMsg != "" {
+					slog.Error("geminiSession: process failed", "error", err, "stderr", stderrMsg)
+					select {
+					case gs.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}:
+					case <-gs.ctx.Done():
+					}
+				}
+			}
+			gs.cancel()
+		}()
+		gs.readLoop(stdout)
+	}()
+
+	return nil
+}
+
+func (gs *geminiSession) Send(prompt string, images []core.ImageAttachment) error {
 	if !gs.alive.Load() {
 		return fmt.Errorf("session is closed")
 	}
@@ -82,7 +169,7 @@ func (gs *geminiSession) Send(prompt string, images []core.ImageAttachment) (err
 				ext = ".webp"
 			}
 			fname := fmt.Sprintf("cc-connect-img-%d%s", i, ext)
-			fpath := fmt.Sprintf("%s/%s", tmpDir, fname)
+			fpath := filepath.Join(tmpDir, fname)
 			if err := os.WriteFile(fpath, img.Data, 0o644); err != nil {
 				slog.Warn("geminiSession: failed to save image", "error", err)
 				continue
@@ -91,107 +178,29 @@ func (gs *geminiSession) Send(prompt string, images []core.ImageAttachment) (err
 		}
 	}
 
-	chatID := gs.CurrentSessionID()
-	isResume := chatID != ""
-
-	args := []string{
-		"--output-format", "stream-json",
-	}
-
-	switch gs.mode {
-	case "yolo":
-		args = append(args, "-y")
-	case "auto_edit":
-		args = append(args, "--approval-mode", "auto_edit")
-	case "plan":
-		args = append(args, "--approval-mode", "plan")
-	}
-
-	if isResume {
-		args = append(args, "--resume", chatID)
-	}
-	if gs.model != "" {
-		args = append(args, "-m", gs.model)
-	}
-
 	// Build the prompt with image file references
 	fullPrompt := prompt
 	if len(imageRefs) > 0 {
 		fullPrompt = strings.Join(imageRefs, " ") + " " + prompt
 	}
 
-	args = append(args, "-p", fullPrompt)
+	gs.enqueueTempFiles(imageRefs)
+	gs.startTurnTimer()
 
-	slog.Debug("geminiSession: launching", "resume", isResume, "args", core.RedactArgs(args))
-
-	// Add timeout for each turn to prevent hanging processes
-	var ctx context.Context
-	var cancel context.CancelFunc
-	if gs.timeout > 0 {
-		ctx, cancel = context.WithTimeout(gs.ctx, gs.timeout)
-	} else {
-		ctx, cancel = context.WithCancel(gs.ctx)
-	}
-
-	// ensure cancel is called on early return errors
-	started := false
-	defer func() {
-		if !started {
-			cancel()
-		}
-	}()
-
-	cmd := exec.CommandContext(ctx, gs.cmd, args...)
-	cmd.Dir = gs.workDir
-	env := os.Environ()
-	if len(gs.extraEnv) > 0 {
-		env = core.MergeEnv(env, gs.extraEnv)
-	}
-	cmd.Env = env
-
-	stdout, err := cmd.StdoutPipe()
+	_, err := fmt.Fprintln(gs.stdin, fullPrompt)
 	if err != nil {
-		return fmt.Errorf("geminiSession: stdout pipe: %w", err)
+		gs.finishTurn(false)
+		return fmt.Errorf("geminiSession: write to stdin: %w", err)
 	}
 
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("geminiSession: start: %w", err)
-	}
-
-	started = true
-	gs.wg.Add(1)
-	go func() {
-		defer cancel()
-		gs.readLoop(cmd, stdout, &stderrBuf, imageRefs)
-	}()
+	// Note: We don't clean up imageRefs immediately because the process
+	// might still be reading them. They will be cleaned up on process exit
+	// or we could add a timer if needed.
 
 	return nil
 }
 
-func (gs *geminiSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer, tempImages []string) {
-	defer gs.wg.Done()
-	defer func() {
-		// Clean up temp image files
-		for _, f := range tempImages {
-			os.Remove(f)
-		}
-		if err := cmd.Wait(); err != nil {
-			stderrMsg := strings.TrimSpace(stderrBuf.String())
-			if stderrMsg != "" {
-				slog.Error("geminiSession: process failed", "error", err, "stderr", stderrMsg)
-				evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
-				select {
-				case gs.events <- evt:
-				case <-gs.ctx.Done():
-					return
-				}
-			}
-		}
-	}()
-
+func (gs *geminiSession) readLoop(stdout io.ReadCloser) {
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
@@ -212,24 +221,24 @@ func (gs *geminiSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf
 		gs.handleEvent(raw)
 	}
 
-	if err := scanner.Err(); err != nil {
+	if err := scanner.Err(); err != nil && gs.ctx.Err() == nil {
 		slog.Error("geminiSession: scanner error", "error", err)
 		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}
 		select {
 		case gs.events <- evt:
 		case <-gs.ctx.Done():
-			return
 		}
 	}
 }
 
 // Gemini CLI stream-json event types:
-//   init       — session_id, model
-//   message    — role (user/assistant), content, delta
-//   tool_use   — tool_name, tool_id, parameters
-//   tool_result — tool_id, status, output, error
-//   error      — severity, message
-//   result     — status, stats (final event)
+//
+//	init       — session_id, model
+//	message    — role (user/assistant), content, delta
+//	tool_use   — tool_name, tool_id, parameters
+//	tool_result — tool_id, status, output, error
+//	error      — severity, message
+//	result     — status, stats (final event)
 func (gs *geminiSession) handleEvent(raw map[string]any) {
 	eventType, _ := raw["type"].(string)
 
@@ -242,12 +251,36 @@ func (gs *geminiSession) handleEvent(raw map[string]any) {
 		gs.handleToolUse(raw)
 	case "tool_result":
 		gs.handleToolResult(raw)
+	case "permission_request":
+		gs.handlePermissionRequest(raw)
 	case "error":
 		gs.handleError(raw)
 	case "result":
 		gs.handleResult(raw)
 	default:
 		slog.Debug("geminiSession: unhandled event", "type", eventType)
+	}
+}
+
+func (gs *geminiSession) handlePermissionRequest(raw map[string]any) {
+	toolName, _ := raw["tool_name"].(string)
+	requestID, _ := raw["request_id"].(string)
+	params, _ := raw["parameters"].(map[string]any)
+
+	input := formatToolParams(toolName, params)
+
+	slog.Debug("geminiSession: permission_request", "tool", toolName, "id", requestID)
+	evt := core.Event{
+		Type:         core.EventPermissionRequest,
+		ToolName:     toolName,
+		ToolInput:    input,
+		ToolInputRaw: params,
+		RequestID:    requestID,
+	}
+	select {
+	case gs.events <- evt:
+	case <-gs.ctx.Done():
+		return
 	}
 }
 
@@ -276,12 +309,14 @@ func (gs *geminiSession) handleMessage(raw map[string]any) {
 		return
 	}
 
-	gs.pendingMsgs = append(gs.pendingMsgs, content)
+	evt := core.Event{Type: core.EventText, Content: content}
+	select {
+	case gs.events <- evt:
+	case <-gs.ctx.Done():
+	}
 }
 
 func (gs *geminiSession) handleToolUse(raw map[string]any) {
-	gs.flushPendingAsThinking()
-
 	toolName, _ := raw["tool_name"].(string)
 	toolID, _ := raw["tool_id"].(string)
 	params, _ := raw["parameters"].(map[string]any)
@@ -329,6 +364,7 @@ func (gs *geminiSession) handleError(raw map[string]any) {
 	message, _ := raw["message"].(string)
 
 	if message != "" {
+		gs.finishTurn(true)
 		slog.Warn("geminiSession: error event", "severity", severity, "message", message)
 		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("[%s] %s", severity, message)}
 		select {
@@ -340,8 +376,7 @@ func (gs *geminiSession) handleError(raw map[string]any) {
 }
 
 func (gs *geminiSession) handleResult(raw map[string]any) {
-	gs.flushPendingAsText()
-
+	gs.finishTurn(true)
 	status, _ := raw["status"].(string)
 
 	var errMsg string
@@ -350,6 +385,21 @@ func (gs *geminiSession) handleResult(raw map[string]any) {
 		if errObj != nil {
 			errMsg, _ = errObj["message"].(string)
 		}
+	}
+
+	// Capture usage stats if available
+	if stats, ok := raw["stats"].(map[string]any); ok {
+		u := &core.ContextUsage{}
+		if pt, ok := stats["prompt_tokens"].(float64); ok {
+			u.PromptTokens = int(pt)
+		}
+		if ct, ok := stats["completion_tokens"].(float64); ok {
+			u.CompletionTokens = int(ct)
+		}
+		if tt, ok := stats["total_tokens"].(float64); ok {
+			u.TotalTokens = int(tt)
+		}
+		gs.usage.Store(u)
 	}
 
 	sid := gs.CurrentSessionID()
@@ -371,38 +421,22 @@ func (gs *geminiSession) handleResult(raw map[string]any) {
 	}
 }
 
-func (gs *geminiSession) flushPendingAsThinking() {
-	if len(gs.pendingMsgs) == 0 {
-		return
+func (gs *geminiSession) RespondPermission(requestID string, result core.PermissionResult) error {
+	if !gs.alive.Load() {
+		return fmt.Errorf("session is closed")
 	}
-	text := strings.Join(gs.pendingMsgs, "")
-	gs.pendingMsgs = gs.pendingMsgs[:0]
-	if text != "" {
-		evt := core.Event{Type: core.EventThinking, Content: text}
-		select {
-		case gs.events <- evt:
-		case <-gs.ctx.Done():
-		}
-	}
-}
 
-func (gs *geminiSession) flushPendingAsText() {
-	if len(gs.pendingMsgs) == 0 {
-		return
+	// Gemini CLI expects the permission result as a JSON object on stdin
+	data, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("geminiSession: marshal permission result: %w", err)
 	}
-	text := strings.Join(gs.pendingMsgs, "")
-	gs.pendingMsgs = gs.pendingMsgs[:0]
-	if text != "" {
-		evt := core.Event{Type: core.EventText, Content: text}
-		select {
-		case gs.events <- evt:
-		case <-gs.ctx.Done():
-		}
-	}
-}
 
-// RespondPermission is a no-op — Gemini CLI permissions are handled via -y / --approval-mode flags.
-func (gs *geminiSession) RespondPermission(_ string, _ core.PermissionResult) error {
+	_, err = fmt.Fprintln(gs.stdin, string(data))
+	if err != nil {
+		return fmt.Errorf("geminiSession: write permission to stdin: %w", err)
+	}
+
 	return nil
 }
 
@@ -421,6 +455,11 @@ func (gs *geminiSession) Alive() bool {
 
 func (gs *geminiSession) Close() error {
 	gs.alive.Store(false)
+	gs.stopTurnTimer()
+	gs.cleanupAllTempFiles()
+	if gs.stdin != nil {
+		gs.stdin.Close()
+	}
 	gs.cancel()
 	done := make(chan struct{})
 	go func() {
@@ -434,6 +473,85 @@ func (gs *geminiSession) Close() error {
 	}
 	close(gs.events)
 	return nil
+}
+
+func (gs *geminiSession) startTurnTimer() {
+	if gs.timeout <= 0 {
+		return
+	}
+	seq := gs.turnSeq.Add(1)
+	timer := time.AfterFunc(gs.timeout, func() {
+		if gs.turnSeq.Load() != seq {
+			return
+		}
+		gs.finishTurn(true)
+		select {
+		case gs.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("geminiSession: turn timed out after %s", gs.timeout)}:
+		case <-gs.ctx.Done():
+		}
+		gs.cancel()
+	})
+
+	gs.timerMu.Lock()
+	if gs.turnTimer != nil {
+		gs.turnTimer.Stop()
+	}
+	gs.turnTimer = timer
+	gs.timerMu.Unlock()
+}
+
+func (gs *geminiSession) stopTurnTimer() {
+	gs.turnSeq.Add(1)
+	gs.timerMu.Lock()
+	if gs.turnTimer != nil {
+		gs.turnTimer.Stop()
+		gs.turnTimer = nil
+	}
+	gs.timerMu.Unlock()
+}
+
+func (gs *geminiSession) finishTurn(cleanupFiles bool) {
+	gs.stopTurnTimer()
+	if cleanupFiles {
+		gs.cleanupCompletedTempFiles()
+	}
+}
+
+func (gs *geminiSession) enqueueTempFiles(paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+	gs.tempFilesMu.Lock()
+	gs.pendingBatches = append(gs.pendingBatches, paths)
+	gs.tempFilesMu.Unlock()
+}
+
+func (gs *geminiSession) cleanupCompletedTempFiles() {
+	gs.tempFilesMu.Lock()
+	if len(gs.pendingBatches) == 0 {
+		gs.tempFilesMu.Unlock()
+		return
+	}
+	paths := gs.pendingBatches[0]
+	gs.pendingBatches = gs.pendingBatches[1:]
+	gs.tempFilesMu.Unlock()
+
+	for _, path := range paths {
+		_ = os.Remove(path)
+	}
+}
+
+func (gs *geminiSession) cleanupAllTempFiles() {
+	gs.tempFilesMu.Lock()
+	batches := gs.pendingBatches
+	gs.pendingBatches = nil
+	gs.tempFilesMu.Unlock()
+
+	for _, paths := range batches {
+		for _, path := range paths {
+			_ = os.Remove(path)
+		}
+	}
 }
 
 // formatToolParams extracts a human-readable summary from tool parameters.

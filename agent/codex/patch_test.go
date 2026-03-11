@@ -74,3 +74,23 @@ func TestPatchSessionSource_Idempotent(t *testing.T) {
 		t.Errorf("file was modified when it shouldn't have been")
 	}
 }
+
+func TestFindSessionFile_FindsNestedCodexSession(t *testing.T) {
+	tmpDir := t.TempDir()
+	sessionID := "nested-session-123"
+	sessionsDir := filepath.Join(tmpDir, ".codex", "sessions", "2026", "03", "11")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	fname := filepath.Join(sessionsDir, "rollout-"+sessionID+".jsonl")
+	if err := os.WriteFile(fname, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("CODEX_HOME", filepath.Join(tmpDir, ".codex"))
+
+	if got := findSessionFile(sessionID); got != fname {
+		t.Fatalf("findSessionFile(%q) = %q, want %q", sessionID, got, fname)
+	}
+}
