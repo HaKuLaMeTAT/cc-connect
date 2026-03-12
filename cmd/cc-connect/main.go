@@ -26,8 +26,8 @@ import (
 	_ "github.com/chenhg5/cc-connect/agent/gemini"
 	_ "github.com/chenhg5/cc-connect/agent/iflow"
 	_ "github.com/chenhg5/cc-connect/agent/opencode"
-	_ "github.com/chenhg5/cc-connect/agent/qwen"
 	_ "github.com/chenhg5/cc-connect/agent/qoder"
+	_ "github.com/chenhg5/cc-connect/agent/qwen"
 
 	_ "github.com/chenhg5/cc-connect/platform/dingtalk"
 	_ "github.com/chenhg5/cc-connect/platform/discord"
@@ -194,6 +194,22 @@ func main() {
 		}
 
 		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
+
+		// Wire multi-workspace mode
+		if proj.Mode == "multi-workspace" {
+			baseDir := proj.BaseDir
+			if strings.HasPrefix(baseDir, "~/") {
+				home, _ := os.UserHomeDir()
+				baseDir = filepath.Join(home, baseDir[2:])
+			}
+			if err := os.MkdirAll(baseDir, 0o755); err != nil {
+				slog.Error("failed to create base_dir", "path", baseDir, "err", err)
+				continue
+			}
+			bindingStore := filepath.Join(cfg.DataDir, "workspace_bindings.json")
+			engine.SetMultiWorkspace(baseDir, bindingStore)
+			slog.Info("multi-workspace mode enabled", "project", proj.Name, "base_dir", baseDir)
+		}
 
 		// Wire global custom commands
 		for _, c := range cfg.Commands {
