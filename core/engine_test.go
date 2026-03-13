@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +29,20 @@ func (s *stubAgentSession) Events() <-chan Event                                
 func (s *stubAgentSession) CurrentSessionID() string                             { return "stub-session" }
 func (s *stubAgentSession) Alive() bool                                          { return true }
 func (s *stubAgentSession) Close() error                                         { return nil }
+
+type recordingAgentSession struct {
+	stubAgentSession
+	lastID     string
+	lastResult PermissionResult
+	calls      int
+}
+
+func (s *recordingAgentSession) RespondPermission(id string, res PermissionResult) error {
+	s.lastID = id
+	s.lastResult = res
+	s.calls++
+	return nil
+}
 
 type stubPlatformEngine struct {
 	n    string
@@ -429,6 +444,106 @@ func TestEngine_DisabledCommandsWithSlash(t *testing.T) {
 
 	if !e.disabledCmds["upgrade"] {
 		t.Error("upgrade should be disabled even when prefixed with /")
+	}
+}
+
+func TestCmdList_MultiWorkspaceUsesWorkspaceSessions(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	globalAgent := &stubListAgent{
+		sessions: []AgentSessionInfo{
+			{ID: "g1", Summary: "Global One", MessageCount: 1},
+		},
+	}
+	e := NewEngine("test", globalAgent, []Platform{p}, "", LangEnglish)
+
+	baseDir := t.TempDir()
+	bindingPath := filepath.Join(t.TempDir(), "bindings.json")
+	e.SetMultiWorkspace(baseDir, bindingPath)
+
+	wsDir := filepath.Join(baseDir, "ws1")
+	if err := os.MkdirAll(wsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	channelID := "C123"
+	e.workspaceBindings.Bind("project:test", channelID, "chan", wsDir)
+
+	ws := e.workspacePool.GetOrCreate(wsDir)
+	ws.agent = &stubListAgent{
+		sessions: []AgentSessionInfo{
+			{ID: "w1", Summary: "Workspace One", MessageCount: 2},
+		},
+	}
+	ws.sessions = NewSessionManager("")
+
+	msg := &Message{SessionKey: "slack:" + channelID + ":U1", ReplyCtx: "ctx"}
+	e.cmdList(p, msg, nil)
+
+	if len(p.sent) == 0 {
+		t.Fatal("expected /list to send a response")
+	}
+	if strings.Contains(p.sent[0], "Global One") {
+		t.Fatalf("expected workspace sessions, got global list: %q", p.sent[0])
+	}
+	if !strings.Contains(p.sent[0], "Workspace One") {
+		t.Fatalf("expected workspace list to contain session summary, got %q", p.sent[0])
+	}
+}
+
+func TestHandlePendingPermission_MultiWorkspaceLookup(t *testing.T) {
+	e := newTestEngine()
+	e.multiWorkspace = true
+
+	sessionKey := "slack:C123:U1"
+	interactiveKey := "/tmp/ws:" + sessionKey
+
+	pending := &pendingPermission{
+		RequestID: "req-1",
+		ToolInput: map[string]any{"path": "/tmp/x"},
+		Resolved:  make(chan struct{}),
+	}
+	session := &recordingAgentSession{}
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[interactiveKey] = &interactiveState{
+		agentSession: session,
+		pending:      pending,
+	}
+	e.interactiveMu.Unlock()
+
+	p := &stubPlatformEngine{n: "test"}
+	msg := &Message{SessionKey: sessionKey, ReplyCtx: "ctx"}
+
+	if !e.handlePendingPermission(p, msg, "allow") {
+		t.Fatal("expected pending permission to be handled")
+	}
+
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[interactiveKey]
+	e.interactiveMu.Unlock()
+	if state == nil {
+		t.Fatal("expected interactive state to remain")
+	}
+	state.mu.Lock()
+	hasPending := state.pending != nil
+	state.mu.Unlock()
+	if hasPending {
+		t.Fatal("expected pending permission to be cleared")
+	}
+
+	select {
+	case <-pending.Resolved:
+	default:
+		t.Fatal("expected pending permission to be resolved")
+	}
+
+	if session.calls != 1 {
+		t.Fatalf("RespondPermission calls = %d, want 1", session.calls)
+	}
+	if session.lastID != "req-1" {
+		t.Fatalf("RespondPermission id = %q, want %q", session.lastID, "req-1")
+	}
+	if session.lastResult.Behavior != "allow" {
+		t.Fatalf("RespondPermission behavior = %q, want %q", session.lastResult.Behavior, "allow")
 	}
 }
 
