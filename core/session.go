@@ -50,6 +50,46 @@ func (s *Session) AddHistory(role, content string) {
 	})
 }
 
+// SetAgentInfo atomically updates the agent session ID and display name.
+func (s *Session) SetAgentInfo(agentSessionID, name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.AgentSessionID = agentSessionID
+	s.Name = name
+}
+
+// SetAgentSessionID atomically updates the agent session ID.
+func (s *Session) SetAgentSessionID(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.AgentSessionID = id
+}
+
+// CompareAndSetAgentSessionID sets the session ID only when it is currently empty.
+func (s *Session) CompareAndSetAgentSessionID(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.AgentSessionID != "" {
+		return false
+	}
+	s.AgentSessionID = id
+	return true
+}
+
+// GetAgentSessionID returns the current agent session ID under lock.
+func (s *Session) GetAgentSessionID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.AgentSessionID
+}
+
+// GetName returns the current session name under lock.
+func (s *Session) GetName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Name
+}
+
 func (s *Session) ClearHistory() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -119,6 +159,13 @@ func (sm *SessionManager) GetOrCreateActive(userKey string) *Session {
 		}
 	}
 	return sm.createLocked(userKey, "default")
+}
+
+// SessionByID returns a session by internal ID, or nil if missing.
+func (sm *SessionManager) SessionByID(id string) *Session {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.sessions[id]
 }
 
 func (sm *SessionManager) NewSession(userKey, name string) *Session {

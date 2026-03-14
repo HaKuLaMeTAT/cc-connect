@@ -607,7 +607,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	}
 
 	content := strings.TrimSpace(msg.Content)
-	if content == "" && len(msg.Images) == 0 {
+	if content == "" && len(msg.Images) == 0 && len(msg.Files) == 0 {
 		return
 	}
 
@@ -823,7 +823,11 @@ func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Se
 	turnStart := time.Now()
 
 	e.i18n.DetectAndSet(msg.Content)
-	session.AddHistory("user", msg.Content)
+	historyContent := strings.TrimSpace(msg.Content)
+	if historyContent == "" && len(msg.Files) > 0 {
+		historyContent = describeAttachedFiles(msg.Files)
+	}
+	session.AddHistory("user", historyContent)
 
 	state := e.getOrCreateInteractiveState(msg.SessionKey, p, msg.ReplyCtx, session)
 
@@ -858,7 +862,8 @@ func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Se
 	state.mu.Lock()
 	state.fromVoice = msg.FromVoice
 	state.mu.Unlock()
-	if err := state.agentSession.Send(msg.Content, msg.Images); err != nil {
+	prompt := e.preparePromptWithFiles(e.agent, "", msg.Content, msg.Files)
+	if err := state.agentSession.Send(prompt, msg.Images); err != nil {
 		slog.Error("failed to send prompt", "error", err)
 
 		if !state.agentSession.Alive() {
@@ -871,7 +876,7 @@ func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Se
 				return
 			}
 			sendStart = time.Now()
-			if err := state.agentSession.Send(msg.Content, msg.Images); err != nil {
+			if err := state.agentSession.Send(prompt, msg.Images); err != nil {
 				e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
 				return
 			}
@@ -887,13 +892,58 @@ func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Se
 	e.processInteractiveEvents(state, session, msg.SessionKey, msg.MessageID, turnStart)
 }
 
+func describeAttachedFiles(files []FileAttachment) string {
+	if len(files) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(files))
+	for _, f := range files {
+		name := strings.TrimSpace(f.FileName)
+		if name == "" {
+			name = "(unnamed file)"
+		}
+		names = append(names, name)
+	}
+	return "Attached file(s): " + strings.Join(names, ", ")
+}
+
+func (e *Engine) preparePromptWithFiles(agent Agent, workspaceDir, prompt string, files []FileAttachment) string {
+	if len(files) == 0 {
+		return prompt
+	}
+
+	workDir := strings.TrimSpace(workspaceDir)
+	if workDir == "" {
+		if wd, ok := agent.(interface{ GetWorkDir() string }); ok {
+			workDir = strings.TrimSpace(wd.GetWorkDir())
+		}
+	}
+	if workDir == "" {
+		workDir, _ = os.Getwd()
+	}
+
+	return AppendFileRefs(prompt, SaveFilesToDisk(workDir, files))
+}
+
 func (e *Engine) getOrCreateInteractiveState(sessionKey string, p Platform, replyCtx any, session *Session) *interactiveState {
 	e.interactiveMu.Lock()
 	defer e.interactiveMu.Unlock()
 
 	state, ok := e.interactiveStates[sessionKey]
 	if ok && state.agentSession != nil && state.agentSession.Alive() {
-		return state
+		wantID := session.GetAgentSessionID()
+		haveID := state.agentSession.CurrentSessionID()
+		if wantID == "" || haveID == "" || wantID == haveID {
+			return state
+		}
+		slog.Info("interactive session mismatch, recycling",
+			"session_key", sessionKey,
+			"want_agent_session", wantID,
+			"have_agent_session", haveID,
+		)
+		go state.agentSession.Close()
+		delete(e.interactiveStates, sessionKey)
+		ok = false
 	}
 
 	// Preserve quiet setting from existing state (e.g. set via /quiet before session started)
@@ -1088,19 +1138,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					sp.appendText(event.Content)
 				}
 			}
-			if event.SessionID != "" {
-				session.mu.Lock()
-				if session.AgentSessionID == "" {
-					session.AgentSessionID = event.SessionID
-					pendingName := session.Name
-					session.mu.Unlock()
-					if pendingName != "" && pendingName != "session" && pendingName != "default" {
-						e.sessions.SetSessionName(event.SessionID, pendingName)
-					}
-					e.sessions.Save()
-				} else {
-					session.mu.Unlock()
+			if event.SessionID != "" && session.CompareAndSetAgentSessionID(event.SessionID) {
+				pendingName := session.GetName()
+				if pendingName != "" && pendingName != "session" && pendingName != "default" {
+					e.sessions.SetSessionName(event.SessionID, pendingName)
 				}
+				e.sessions.Save()
 			}
 
 		case EventPermissionRequest:
@@ -1160,9 +1203,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		case EventResult:
 			if event.SessionID != "" {
-				session.mu.Lock()
-				session.AgentSessionID = event.SessionID
-				session.mu.Unlock()
+				session.SetAgentSessionID(event.SessionID)
 			}
 
 			fullResponse := event.Content
@@ -1625,8 +1666,7 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	slog.Info("cmdSwitch: cleanup done", "session_key", msg.SessionKey)
 
 	session := e.sessions.GetOrCreateActive(msg.SessionKey)
-	session.AgentSessionID = matched.ID
-	session.Name = matched.Summary
+	session.SetAgentInfo(matched.ID, matched.Summary)
 	session.ClearHistory()
 	e.sessions.Save()
 
@@ -3083,7 +3123,7 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 	e.cleanupInteractiveState(msg.SessionKey)
 
 	s := e.sessions.GetOrCreateActive(msg.SessionKey)
-	s.AgentSessionID = ""
+	s.SetAgentSessionID("")
 	s.ClearHistory()
 	e.sessions.Save()
 
@@ -3172,7 +3212,7 @@ func (e *Engine) cmdReasoning(p Platform, msg *Message, args []string) {
 	e.cleanupInteractiveState(msg.SessionKey)
 
 	s := e.sessions.GetOrCreateActive(msg.SessionKey)
-	s.AgentSessionID = ""
+	s.SetAgentSessionID("")
 	s.ClearHistory()
 	e.sessions.Save()
 
@@ -4020,7 +4060,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		switcher.SetModel(target)
 		e.cleanupInteractiveState(sessionKey)
 		s := e.sessions.GetOrCreateActive(sessionKey)
-		s.AgentSessionID = ""
+		s.SetAgentSessionID("")
 		s.ClearHistory()
 		e.sessions.Save()
 
@@ -4048,7 +4088,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 				switcher.SetReasoningEffort(target)
 				e.cleanupInteractiveState(sessionKey)
 				s := e.sessions.GetOrCreateActive(sessionKey)
-				s.AgentSessionID = ""
+				s.SetAgentSessionID("")
 				s.ClearHistory()
 				e.sessions.Save()
 				return
@@ -4137,8 +4177,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		}
 		e.cleanupInteractiveState(sessionKey)
 		session := e.sessions.GetOrCreateActive(sessionKey)
-		session.AgentSessionID = matched.ID
-		session.Name = matched.Summary
+		session.SetAgentInfo(matched.ID, matched.Summary)
 		session.ClearHistory()
 		e.sessions.Save()
 
@@ -5702,26 +5741,30 @@ func truncateIf(s string, maxLen int) string {
 }
 
 func splitMessage(text string, maxLen int) []string {
-	if len(text) <= maxLen {
+	runes := []rune(text)
+	if len(runes) <= maxLen {
 		return []string{text}
 	}
 	var chunks []string
 
-	for len(text) > 0 {
-		if len(text) <= maxLen {
-			chunks = append(chunks, text)
+	for len(runes) > 0 {
+		if len(runes) <= maxLen {
+			chunks = append(chunks, string(runes))
 			break
 		}
 
 		end := maxLen
 
 		// Try to split at newline boundary
-		if idx := strings.LastIndex(text[:end], "\n"); idx > 0 && idx >= end/2 {
-			end = idx + 1
+		for i := end - 1; i >= 0 && i >= end/2; i-- {
+			if runes[i] == '\n' {
+				end = i + 1
+				break
+			}
 		}
 
-		chunk := text[:end]
-		text = text[end:]
+		chunk := string(runes[:end])
+		runes = runes[end:]
 
 		chunks = append(chunks, chunk)
 	}
@@ -5791,8 +5834,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 	}
 	defer agentSession.Close()
 
-	if session.AgentSessionID == "" {
-		session.AgentSessionID = agentSession.CurrentSessionID()
+	if session.CompareAndSetAgentSessionID(agentSession.CurrentSessionID()) {
 		e.sessions.Save()
 	}
 
@@ -5820,13 +5862,12 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 				if event.Content != "" {
 					textParts = append(textParts, event.Content)
 				}
-				if event.SessionID != "" && session.AgentSessionID == "" {
-					session.AgentSessionID = event.SessionID
+				if event.SessionID != "" && session.CompareAndSetAgentSessionID(event.SessionID) {
 					e.sessions.Save()
 				}
 			case EventResult:
 				if event.SessionID != "" {
-					session.AgentSessionID = event.SessionID
+					session.SetAgentSessionID(event.SessionID)
 					e.sessions.Save()
 				}
 				resp := event.Content
