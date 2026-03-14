@@ -30,7 +30,7 @@ type Config struct {
 	RateLimit     RateLimitConfig     `toml:"rate_limit"`     // per-session rate limiting
 	Quiet            *bool               `toml:"quiet,omitempty"`              // global default for quiet mode; project-level overrides this
 	Cron             CronConfig          `toml:"cron"`
-	IdleTimeoutMins  *int                `toml:"idle_timeout_mins,omitempty"`  // max minutes between agent events; 0 = no timeout; default 120
+	IdleTimeoutMins *int                `toml:"idle_timeout_mins,omitempty"` // max minutes between agent events; 0 = no timeout; default 120
 }
 
 // CronConfig controls cron job behavior.
@@ -492,6 +492,79 @@ func SaveDisplayConfig(thinkingMaxLen, toolMaxLen *int) error {
 	if toolMaxLen != nil {
 		cfg.Display.ToolMaxLen = toolMaxLen
 	}
+	return saveConfig(cfg)
+}
+
+// SaveProjectModel persists the selected model for a project.
+func SaveProjectModel(projectName, model string) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return fmt.Errorf("config path not set")
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	for i := range cfg.Projects {
+		if cfg.Projects[i].Name == projectName {
+			if cfg.Projects[i].Agent.Options == nil {
+				cfg.Projects[i].Agent.Options = make(map[string]any)
+			}
+			cfg.Projects[i].Agent.Options["model"] = model
+			return saveConfig(cfg)
+		}
+	}
+	return fmt.Errorf("project %q not found in config", projectName)
+}
+
+// SaveProjectReasoningEffort persists the selected reasoning effort for a project.
+func SaveProjectReasoningEffort(projectName, effort string) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return fmt.Errorf("config path not set")
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	for i := range cfg.Projects {
+		if cfg.Projects[i].Name == projectName {
+			if cfg.Projects[i].Agent.Options == nil {
+				cfg.Projects[i].Agent.Options = make(map[string]any)
+			}
+			cfg.Projects[i].Agent.Options["reasoning_effort"] = effort
+			return saveConfig(cfg)
+		}
+	}
+	return fmt.Errorf("project %q not found in config", projectName)
+}
+
+// SaveGlobalQuiet persists the global default quiet mode.
+func SaveGlobalQuiet(quiet bool) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return fmt.Errorf("config path not set")
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	cfg.Quiet = &quiet
 	return saveConfig(cfg)
 }
 

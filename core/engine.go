@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -136,6 +137,10 @@ type Engine struct {
 
 	ttsSaveFunc func(mode string) error
 
+	modelSaveFunc       func(model string) error
+	reasoningSaveFunc   func(effort string) error
+	globalQuietSaveFunc func(quiet bool) error
+
 	commandSaveAddFunc func(name, description, prompt, exec, workDir string) error
 	commandSaveDelFunc func(name string) error
 
@@ -244,6 +249,18 @@ func (e *Engine) SetTTSConfig(cfg *TTSCfg) {
 // SetTTSSaveFunc registers a callback that persists TTS mode changes.
 func (e *Engine) SetTTSSaveFunc(fn func(mode string) error) {
 	e.ttsSaveFunc = fn
+}
+
+func (e *Engine) SetModelSaveFunc(fn func(model string) error) {
+	e.modelSaveFunc = fn
+}
+
+func (e *Engine) SetReasoningSaveFunc(fn func(effort string) error) {
+	e.reasoningSaveFunc = fn
+}
+
+func (e *Engine) SetGlobalQuietSaveFunc(fn func(quiet bool) error) {
+	e.globalQuietSaveFunc = fn
 }
 
 // SetDisplayConfig overrides the default truncation settings.
@@ -470,7 +487,7 @@ func (e *Engine) Start() error {
 
 		// Register commands on platforms that support it (e.g. Telegram setMyCommands)
 		if registrar, ok := p.(CommandRegistrar); ok {
-			commands := e.GetAllCommands()
+			commands := e.GetMenuCommands(p.Name())
 			if err := registrar.RegisterCommands(commands); err != nil {
 				slog.Error("platform command registration failed", "project", e.name, "platform", p.Name(), "error", err)
 			} else {
@@ -597,6 +614,16 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	// Resolve aliases: check if the first word (or whole content) matches an alias
 	content = e.resolveAlias(content)
 	msg.Content = content
+	if strings.Contains(strings.ToLower(content), "sendto") {
+		slog.Info("sendto: content seen in message", "project", e.name, "session", msg.SessionKey, "content", content)
+	}
+
+	if len(msg.Images) == 0 {
+		if sendToArgs, ok := extractSendToArgs(content); ok {
+			e.cmdSendTo(p, msg, sendToArgs)
+			return
+		}
+	}
 
 	// Rate limit check
 	if e.rateLimiter != nil && !e.rateLimiter.Allow(msg.SessionKey) {
@@ -1281,7 +1308,7 @@ var builtinCommands = []struct {
 	{[]string{"shell", "sh", "exec", "run"}, "shell"},
 	{[]string{"tts"}, "tts"},
 	{[]string{"usage", "tokens", "token"}, "usage"},
-	{[]string{"sendto", "quote"}, "sendto"},
+	{[]string{"sendto", "quote", "fwd"}, "sendto"},
 }
 
 // matchPrefix finds a unique command matching the given prefix.
@@ -1460,6 +1487,9 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 			return
 		}
 		if len(agentSessions) == 0 {
+			agentSessions = e.fallbackListSessions(msg.SessionKey)
+		}
+		if len(agentSessions) == 0 {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgListEmpty))
 			return
 		}
@@ -1535,6 +1565,39 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 		return
 	}
 	e.replyWithCard(p, msg.ReplyCtx, card)
+}
+
+func (e *Engine) fallbackListSessions(sessionKey string) []AgentSessionInfo {
+	localSessions := e.sessions.ListSessions(sessionKey)
+	if len(localSessions) == 0 {
+		return nil
+	}
+
+	var result []AgentSessionInfo
+	for _, s := range localSessions {
+		if s == nil || strings.TrimSpace(s.AgentSessionID) == "" {
+			continue
+		}
+
+		summary := strings.TrimSpace(s.Name)
+		if summary == "" && len(s.History) > 0 {
+			summary = strings.TrimSpace(s.History[len(s.History)-1].Content)
+		}
+		if summary == "" {
+			summary = s.AgentSessionID
+		}
+		result = append(result, AgentSessionInfo{
+			ID:           s.AgentSessionID,
+			Summary:      truncateStr(summary, 60),
+			MessageCount: len(s.History),
+			ModifiedAt:   s.UpdatedAt,
+		})
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].ModifiedAt.After(result[j].ModifiedAt)
+	})
+	return result
 }
 
 func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
@@ -1867,17 +1930,21 @@ func (e *Engine) cmdUsage(p Platform, msg *Message) {
 	sb.WriteString(fmt.Sprintf("• %s: **%d**\n", e.i18n.T(MsgUsageCompletion), usage.CompletionTokens))
 	sb.WriteString(fmt.Sprintf("• %s: **%d**\n", e.i18n.T(MsgUsageTotal), usage.TotalTokens))
 
+	primaryQuota, secondaryQuota, extraQuotas := splitUsageQuotas(usage.OtherQuotas)
+	if primaryQuota != nil {
+		sb.WriteString("\n" + e.renderQuota(e.i18n.T(MsgUsagePrimary), primaryQuota))
+	}
 	if usage.DailyQuota != nil {
 		sb.WriteString("\n" + e.renderQuota(e.i18n.T(MsgUsageDaily), usage.DailyQuota))
 	}
 	if usage.WeeklyQuota != nil {
 		sb.WriteString("\n" + e.renderQuota(e.i18n.T(MsgUsageWeekly), usage.WeeklyQuota))
 	}
-	for _, q := range usage.OtherQuotas {
-		label := q.Label
-		if label == "" {
-			label = "Quota"
-		}
+	if secondaryQuota != nil {
+		sb.WriteString("\n" + e.renderQuota(e.i18n.T(MsgUsageSecondary), secondaryQuota))
+	}
+	for _, q := range extraQuotas {
+		label := e.usageQuotaLabel(q.Label)
 		sb.WriteString("\n" + e.renderQuota(label, &q))
 	}
 
@@ -1885,30 +1952,44 @@ func (e *Engine) cmdUsage(p Platform, msg *Message) {
 }
 
 func (e *Engine) cmdSendTo(p Platform, msg *Message, args []string) {
+	slog.Info("sendto: invoked", "project", e.name, "session", msg.SessionKey, "args", args, "reply_to_message_id", msg.ReplyToMessageID)
 	if !e.allowSendTo(msg.SessionKey) {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSendToRateLimited))
 		return
 	}
 
-	if msg.ReplyToMessageID == "" {
+	replyText := strings.TrimSpace(msg.ReplyToContent)
+	if msg.ReplyToMessageID == "" && replyText == "" {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSendToNoReply))
 		return
 	}
 
-	resolver, ok := p.(ReplyTextResolver)
-	if !ok {
-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSendToNotSupported))
-		return
+	if msg.ReplyToMessageID != "" {
+		resolver, ok := p.(ReplyTextResolver)
+		if !ok {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSendToNotSupported))
+			return
+		}
+
+		if resolved, ok := resolver.ResolveReplyText(msg.ReplyCtx, msg.ReplyToMessageID); ok {
+			replyText = strings.TrimSpace(resolved)
+		}
 	}
 
-	replyText, ok := resolver.ResolveReplyText(msg.ReplyCtx, msg.ReplyToMessageID)
-	if !ok {
-		replyText = strings.TrimSpace(msg.ReplyToContent)
-	}
 	if strings.TrimSpace(replyText) == "" {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSendToResolveFailed))
 		return
 	}
+
+	if target := e.resolveSendToTarget(msg.SessionKey, args); target != "" && target != e.name {
+		slog.Info("sendto: resolved target", "project", e.name, "target", target)
+		if err := e.sendToOtherBot(msg.SessionKey, target, buildSendToPrompt(replyText, strings.TrimSpace(strings.Join(args[1:], " ")))); err != nil {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+		}
+		return
+	}
+
+	slog.Warn("sendto: target not resolved, falling back to current bot", "project", e.name, "args", args)
 
 	forwarded := *msg
 	forwarded.Content = buildSendToPrompt(replyText, strings.TrimSpace(strings.Join(args, " ")))
@@ -1917,6 +1998,27 @@ func (e *Engine) cmdSendTo(p Platform, msg *Message, args []string) {
 	forwarded.Images = nil
 	forwarded.Audio = nil
 	e.handleMessage(p, &forwarded)
+}
+
+func extractSendToArgs(content string) ([]string, bool) {
+	content = strings.TrimSpace(content)
+	lower := strings.ToLower(content)
+	idx := strings.Index(lower, "sendto")
+	if idx < 0 {
+		return nil, false
+	}
+
+	prefix := strings.TrimSpace(strings.TrimRight(strings.TrimSpace(content[:idx]), "/"))
+	tail := strings.TrimLeft(content[idx+len("sendto"):], " /\t\n")
+	args := strings.Fields(tail)
+	if prefix != "" {
+		if containsSendToTargetToken(args) {
+			args = append(args, prefix)
+		} else {
+			args = append([]string{prefix}, args...)
+		}
+	}
+	return args, true
 }
 
 const sendToWindow = time.Minute
@@ -1951,7 +2053,7 @@ func (e *Engine) allowSendTo(sessionKey string) bool {
 }
 
 func buildSendToPrompt(replyText, instruction string) string {
-	replyText = strings.TrimSpace(replyText)
+	replyText = normalizeSendToReplyText(replyText)
 	instruction = strings.TrimSpace(instruction)
 	if instruction == "" {
 		return "Forwarded message:\n\n" + replyText
@@ -1959,9 +2061,231 @@ func buildSendToPrompt(replyText, instruction string) string {
 	return "Forwarded message:\n\n" + replyText + "\n\nUser request:\n" + instruction
 }
 
+func normalizeSendToReplyText(text string) string {
+	text = strings.TrimSpace(text)
+	for {
+		changed := false
+		switch {
+		case strings.HasPrefix(text, "转发内容："):
+			text = strings.TrimSpace(strings.TrimPrefix(text, "转发内容："))
+			changed = true
+		case strings.HasPrefix(text, "转发内容:"):
+			text = strings.TrimSpace(strings.TrimPrefix(text, "转发内容:"))
+			changed = true
+		case strings.HasPrefix(strings.ToLower(text), "forwarded message:"):
+			text = strings.TrimSpace(text[len("Forwarded message:"):])
+			changed = true
+		}
+
+		if strings.HasPrefix(text, "[") {
+			if idx := strings.Index(text, "]"); idx > 0 && idx < 40 {
+				text = strings.TrimSpace(text[idx+1:])
+				changed = true
+			}
+		}
+
+		if !changed {
+			break
+		}
+	}
+	return text
+}
+
+func (e *Engine) resolveSendToTarget(sessionKey string, args []string) string {
+	if len(args) == 0 || e.relayManager == nil {
+		return ""
+	}
+
+	candidates := e.relayManager.ListEngineNames()
+	if _, chatID, err := parseSessionKeyParts(sessionKey); err == nil {
+		for name := range e.relayManager.ListBoundBots(chatID, e.name) {
+			candidates = append(candidates, name)
+		}
+	}
+
+	seen := make(map[string]struct{})
+	var unique []string
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		unique = append(unique, candidate)
+	}
+
+	for _, raw := range args {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		normalized := strings.TrimPrefix(strings.ToLower(raw), "@")
+		normalized = strings.ReplaceAll(normalized, "-", "_")
+		normalizedNoBot := strings.TrimSuffix(strings.TrimSuffix(normalized, "_bot"), "bot")
+
+		for _, candidate := range unique {
+			candidateNorm := strings.ReplaceAll(strings.ToLower(candidate), "-", "_")
+			if strings.EqualFold(candidate, raw) ||
+				candidateNorm == normalized ||
+				candidateNorm == normalizedNoBot ||
+				"bz_"+candidateNorm == normalized ||
+				"bz_"+candidateNorm == normalizedNoBot ||
+				candidateNorm+"_bot" == normalized ||
+				candidateNorm+"_bot" == normalizedNoBot {
+				return candidate
+			}
+		}
+	}
+
+	var matched string
+	for _, raw := range args {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		normalized := strings.TrimPrefix(strings.ToLower(raw), "@")
+		normalized = strings.ReplaceAll(normalized, "-", "_")
+		normalizedNoBot := strings.TrimSuffix(strings.TrimSuffix(normalized, "_bot"), "bot")
+
+		for _, candidate := range unique {
+			candidateNorm := strings.ReplaceAll(strings.ToLower(candidate), "-", "_")
+			if strings.Contains(normalized, candidateNorm) || strings.Contains(normalizedNoBot, candidateNorm) {
+				if matched != "" && matched != candidate {
+					return ""
+				}
+				matched = candidate
+			}
+		}
+	}
+	return matched
+}
+
+func containsSendToTargetToken(args []string) bool {
+	for _, arg := range args {
+		if strings.HasPrefix(strings.TrimSpace(arg), "@") {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) sendToOtherBot(sessionKey, target, content string) error {
+	slog.Info("sendto: enter sendToOtherBot", "from", e.name, "to", target, "session", sessionKey)
+	if e.relayManager == nil {
+		slog.Warn("sendto: relay manager missing", "from", e.name, "to", target)
+		return fmt.Errorf("relay is not available")
+	}
+
+	platformName, chatID, err := parseSessionKeyParts(sessionKey)
+	if err != nil {
+		slog.Warn("sendto: invalid session key", "session", sessionKey, "error", err)
+		return err
+	}
+
+	e.relayManager.mu.RLock()
+	targetEngine := e.relayManager.engines[target]
+	e.relayManager.mu.RUnlock()
+	if targetEngine == nil {
+		slog.Warn("sendto: target engine not found", "target", target)
+		return fmt.Errorf("target engine %q not found", target)
+	}
+
+	if targetPlatform, replyCtx, ok := resolveEngineReplyTarget(targetEngine, platformName, sessionKey); ok {
+		slog.Info("sendto: delivering via target relay flow", "from", e.name, "to", target, "session", sessionKey)
+		go func() {
+			timeout := relayTimeoutForProject(target)
+			ctx, cancel := context.WithTimeout(e.ctx, timeout)
+			defer cancel()
+
+			var stopTyping func()
+			if ti, ok := targetPlatform.(TypingIndicator); ok {
+				stopTyping = ti.StartTyping(ctx, replyCtx)
+			}
+			defer func() {
+				if stopTyping != nil {
+					stopTyping()
+				}
+			}()
+
+			type result struct {
+				resp string
+				err  error
+			}
+			done := make(chan result, 1)
+			go func() {
+				resp, err := targetEngine.HandleRelay(ctx, e.name, chatID, content)
+				done <- result{resp: resp, err: err}
+			}()
+
+			select {
+			case out := <-done:
+				if out.err != nil {
+					errMsg := fmt.Sprintf(e.i18n.T(MsgError), out.err)
+					slog.Warn("sendto: target relay returned error", "from", e.name, "to", target, "session", sessionKey, "error", out.err)
+					if sendErr := targetPlatform.Send(context.Background(), replyCtx, errMsg); sendErr != nil {
+						slog.Error("sendto: failed to send target relay error", "from", e.name, "to", target, "session", sessionKey, "error", sendErr)
+					}
+					return
+				}
+				resp := out.resp
+				if strings.TrimSpace(resp) == "" {
+					resp = e.i18n.T(MsgEmptyResponse)
+				}
+				slog.Info("sendto: sending target relay response", "from", e.name, "to", target, "session", sessionKey, "response_len", len(resp))
+				if sendErr := targetPlatform.Send(context.Background(), replyCtx, resp); sendErr != nil {
+					slog.Error("sendto: failed to send target relay response", "from", e.name, "to", target, "session", sessionKey, "error", sendErr)
+				}
+			case <-ctx.Done():
+				slog.Warn("sendto: target relay timed out", "from", e.name, "to", target, "session", sessionKey, "timeout", timeout)
+				errMsg := fmt.Sprintf(e.i18n.T(MsgError), ctx.Err())
+				if sendErr := targetPlatform.Send(context.Background(), replyCtx, errMsg); sendErr != nil {
+					slog.Error("sendto: failed to send target relay timeout", "from", e.name, "to", target, "session", sessionKey, "error", sendErr)
+				}
+			}
+		}()
+		return nil
+	}
+
+	req := RelayRequest{
+		From:       e.name,
+		To:         target,
+		SessionKey: sessionKey,
+		Message:    content,
+	}
+	ctx, cancel := context.WithTimeout(e.ctx, relayTimeout)
+	defer cancel()
+	slog.Info("sendto: falling back to relay manager", "from", e.name, "to", target, "session", sessionKey)
+	_, err = e.relayManager.Send(ctx, req)
+	return err
+}
+
+func resolveEngineReplyTarget(targetEngine *Engine, platformName, sessionKey string) (Platform, any, bool) {
+	for _, p := range targetEngine.platforms {
+		if p.Name() != platformName {
+			continue
+		}
+		rc, ok := p.(ReplyContextReconstructor)
+		if !ok {
+			continue
+		}
+		replyCtx, err := rc.ReconstructReplyCtx(sessionKey)
+		if err != nil {
+			continue
+		}
+		return p, replyCtx, true
+	}
+	return nil, nil, false
+}
+
 func (e *Engine) renderQuota(label string, q *UsageQuota) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("• %s: **%.1f%%** %s\n", label, q.UsedPercent, e.usageProgressBar(q.UsedPercent)))
+	if q.WindowMinutes > 0 {
+		sb.WriteString(fmt.Sprintf("  └ %s\n", formatUsageWindow(q.WindowMinutes)+" window"))
+	}
 
 	if !q.ResetsAt.IsZero() {
 		timeLeft := time.Until(q.ResetsAt)
@@ -1972,6 +2296,45 @@ func (e *Engine) renderQuota(label string, q *UsageQuota) string {
 		}
 	}
 	return sb.String()
+}
+
+func (e *Engine) usageQuotaLabel(label string) string {
+	switch strings.ToLower(strings.TrimSpace(label)) {
+	case "primary":
+		return e.i18n.T(MsgUsagePrimary)
+	case "secondary":
+		return e.i18n.T(MsgUsageSecondary)
+	case "daily":
+		return e.i18n.T(MsgUsageDaily)
+	case "weekly":
+		return e.i18n.T(MsgUsageWeekly)
+	case "":
+		return "Quota"
+	default:
+		return label
+	}
+}
+
+func splitUsageQuotas(quotas []UsageQuota) (primary, secondary *UsageQuota, extras []UsageQuota) {
+	for i := range quotas {
+		q := quotas[i]
+		switch strings.ToLower(strings.TrimSpace(q.Label)) {
+		case "primary":
+			if primary == nil {
+				copy := q
+				primary = &copy
+				continue
+			}
+		case "secondary":
+			if secondary == nil {
+				copy := q
+				secondary = &copy
+				continue
+			}
+		}
+		extras = append(extras, q)
+	}
+	return primary, secondary, extras
 }
 
 func (e *Engine) usageProgressBar(percent float64) string {
@@ -1995,12 +2358,18 @@ func formatUsagePercent(v float64) string {
 
 func formatUsageWindow(minutes int) string {
 	switch {
-	case minutes%10080 == 0:
-		return fmt.Sprintf("%dw", minutes/10080)
-	case minutes%1440 == 0:
-		return fmt.Sprintf("%dd", minutes/1440)
-	case minutes%60 == 0:
-		return fmt.Sprintf("%dh", minutes/60)
+	case minutes >= 1440:
+		days := int(math.Round(float64(minutes) / 1440.0))
+		if days <= 0 {
+			days = 1
+		}
+		return fmt.Sprintf("%dd", days)
+	case minutes >= 60:
+		hours := int(math.Round(float64(minutes) / 60.0))
+		if hours <= 0 {
+			hours = 1
+		}
+		return fmt.Sprintf("%dh", hours)
 	default:
 		return fmt.Sprintf("%dm", minutes)
 	}
@@ -2595,6 +2964,33 @@ func (e *Engine) GetAllCommands() []BotCommandInfo {
 	return commands
 }
 
+func (e *Engine) GetMenuCommands(platformName string) []BotCommandInfo {
+	if !strings.EqualFold(platformName, "telegram") {
+		return e.GetAllCommands()
+	}
+
+	allowed := map[string]struct{}{
+		"help":      {},
+		"new":       {},
+		"list":      {},
+		"current":   {},
+		"model":     {},
+		"reasoning": {},
+		"mode":      {},
+		"usage":     {},
+		"bind":      {},
+		"status":    {},
+	}
+
+	var commands []BotCommandInfo
+	for _, c := range e.GetAllCommands() {
+		if _, ok := allowed[strings.ToLower(c.Command)]; ok {
+			commands = append(commands, c)
+		}
+	}
+	return commands
+}
+
 func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 	switcher, ok := e.agent.(ModelSwitcher)
 	if !ok {
@@ -2673,6 +3069,14 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 	target := args[0]
 	if idx, err := strconv.Atoi(target); err == nil && idx >= 1 && idx <= len(models) {
 		target = models[idx-1].Name
+	}
+
+	if e.modelSaveFunc != nil {
+		if err := e.modelSaveFunc(target); err != nil {
+			slog.Error("failed to save model", "model", target, "error", err)
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+			return
+		}
 	}
 
 	switcher.SetModel(target)
@@ -2754,6 +3158,14 @@ func (e *Engine) cmdReasoning(p Platform, msg *Message, args []string) {
 	if !valid {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgReasoningUsage))
 		return
+	}
+
+	if e.reasoningSaveFunc != nil {
+		if err := e.reasoningSaveFunc(target); err != nil {
+			slog.Error("failed to save reasoning effort", "reasoning_effort", target, "error", err)
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+			return
+		}
 	}
 
 	switcher.SetReasoningEffort(target)
@@ -2844,8 +3256,20 @@ func (e *Engine) cmdMode(p Platform, msg *Message, args []string) {
 func (e *Engine) cmdQuiet(p Platform, msg *Message, args []string) {
 	// /quiet global — toggle global quiet for all sessions
 	if len(args) > 0 && args[0] == "global" {
+		e.quietMu.RLock()
+		nextQuiet := !e.quiet
+		e.quietMu.RUnlock()
+
+		if e.globalQuietSaveFunc != nil {
+			if err := e.globalQuietSaveFunc(nextQuiet); err != nil {
+				slog.Error("failed to save global quiet", "quiet", nextQuiet, "error", err)
+				e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+				return
+			}
+		}
+
 		e.quietMu.Lock()
-		e.quiet = !e.quiet
+		e.quiet = nextQuiet
 		quiet := e.quiet
 		e.quietMu.Unlock()
 
@@ -3587,6 +4011,12 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		if idx, err := strconv.Atoi(target); err == nil && idx >= 1 && idx <= len(models) {
 			target = models[idx-1].Name
 		}
+		if e.modelSaveFunc != nil {
+			if err := e.modelSaveFunc(target); err != nil {
+				slog.Error("failed to save model from card action", "model", target, "error", err)
+				return
+			}
+		}
 		switcher.SetModel(target)
 		e.cleanupInteractiveState(sessionKey)
 		s := e.sessions.GetOrCreateActive(sessionKey)
@@ -3609,6 +4039,12 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		}
 		for _, effort := range efforts {
 			if effort == target {
+				if e.reasoningSaveFunc != nil {
+					if err := e.reasoningSaveFunc(target); err != nil {
+						slog.Error("failed to save reasoning effort from card action", "reasoning_effort", target, "error", err)
+						return
+					}
+				}
 				switcher.SetReasoningEffort(target)
 				e.cleanupInteractiveState(sessionKey)
 				s := e.sessions.GetOrCreateActive(sessionKey)
@@ -5326,6 +5762,12 @@ func (e *Engine) sendTTSReply(p Platform, replyCtx any, text string) {
 // dedicated relay session, sends the message to the agent, and blocks until
 // the complete response is collected.
 func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message string) (string, error) {
+	if strings.EqualFold(e.name, "gemini") {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, geminiRelayTimeout)
+		defer cancel()
+	}
+
 	relaySessionKey := "relay:" + fromProject + ":" + chatID
 	session := e.sessions.GetOrCreateActive(relaySessionKey)
 
@@ -5347,6 +5789,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 	if err != nil {
 		return "", fmt.Errorf("start relay session: %w", err)
 	}
+	defer agentSession.Close()
 
 	if session.AgentSessionID == "" {
 		session.AgentSessionID = agentSession.CurrentSessionID()
@@ -5358,51 +5801,57 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 	}
 
 	var textParts []string
-	for event := range agentSession.Events() {
-		if ctx.Err() != nil {
+	events := agentSession.Events()
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Warn("relay: context done", "from", fromProject, "to", e.name, "error", ctx.Err())
 			return "", ctx.Err()
-		}
-		switch event.Type {
-		case EventText:
-			if event.Content != "" {
-				textParts = append(textParts, event.Content)
+		case event, ok := <-events:
+			if !ok {
+				if len(textParts) > 0 {
+					return strings.Join(textParts, ""), nil
+				}
+				return "", fmt.Errorf("relay: agent process exited without response")
 			}
-			if event.SessionID != "" && session.AgentSessionID == "" {
-				session.AgentSessionID = event.SessionID
-				e.sessions.Save()
-			}
-		case EventResult:
-			if event.SessionID != "" {
-				session.AgentSessionID = event.SessionID
-				e.sessions.Save()
-			}
-			resp := event.Content
-			if resp == "" && len(textParts) > 0 {
-				resp = strings.Join(textParts, "")
-			}
-			if resp == "" {
-				resp = "(empty response)"
-			}
-			slog.Info("relay: turn complete", "from", fromProject, "to", e.name, "response_len", len(resp))
-			return resp, nil
-		case EventError:
-			if event.Error != nil {
-				return "", event.Error
-			}
-			return "", fmt.Errorf("agent error (no details)")
-		case EventPermissionRequest:
-			// Auto-approve all permissions in relay mode
-			_ = agentSession.RespondPermission(event.RequestID, PermissionResult{
-				Behavior:     "allow",
-				UpdatedInput: event.ToolInputRaw,
-			})
-		}
-	}
 
-	if len(textParts) > 0 {
-		return strings.Join(textParts, ""), nil
+			switch event.Type {
+			case EventText:
+				if event.Content != "" {
+					textParts = append(textParts, event.Content)
+				}
+				if event.SessionID != "" && session.AgentSessionID == "" {
+					session.AgentSessionID = event.SessionID
+					e.sessions.Save()
+				}
+			case EventResult:
+				if event.SessionID != "" {
+					session.AgentSessionID = event.SessionID
+					e.sessions.Save()
+				}
+				resp := event.Content
+				if resp == "" && len(textParts) > 0 {
+					resp = strings.Join(textParts, "")
+				}
+				if resp == "" {
+					resp = "(empty response)"
+				}
+				slog.Info("relay: turn complete", "from", fromProject, "to", e.name, "response_len", len(resp))
+				return resp, nil
+			case EventError:
+				if event.Error != nil {
+					return "", event.Error
+				}
+				return "", fmt.Errorf("agent error (no details)")
+			case EventPermissionRequest:
+				// Auto-approve all permissions in relay mode
+				_ = agentSession.RespondPermission(event.RequestID, PermissionResult{
+					Behavior:     "allow",
+					UpdatedInput: event.ToolInputRaw,
+				})
+			}
+		}
 	}
-	return "", fmt.Errorf("relay: agent process exited without response")
 }
 
 // cmdBind handles /bind — establishes a relay binding between bots in a group chat.

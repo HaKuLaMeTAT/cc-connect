@@ -37,9 +37,10 @@ type geminiSession struct {
 	wg       sync.WaitGroup
 	alive    atomic.Bool
 
-	stdin io.WriteCloser
-
 	usage atomic.Pointer[core.ContextUsage]
+
+	turnMu     sync.Mutex
+	turnActive bool
 
 	turnSeq   atomic.Uint64
 	timerMu   sync.Mutex
@@ -69,15 +70,10 @@ func newGeminiSession(ctx context.Context, cmd, workDir, model, mode, resumeID s
 		gs.chatID.Store(resumeID)
 	}
 
-	if err := gs.startProcess(); err != nil {
-		cancel()
-		return nil, err
-	}
-
 	return gs, nil
 }
 
-func (gs *geminiSession) startProcess() error {
+func (gs *geminiSession) buildArgs() []string {
 	args := []string{
 		"--output-format", "stream-json",
 	}
@@ -98,60 +94,58 @@ func (gs *geminiSession) startProcess() error {
 		args = append(args, "-m", gs.model)
 	}
 
-	slog.Debug("geminiSession: launching persistent process", "args", core.RedactArgs(args))
+	return args
+}
 
-	cmd := exec.CommandContext(gs.ctx, gs.cmd, args...)
-	cmd.Dir = gs.workDir
+func (gs *geminiSession) buildEnv() []string {
 	env := os.Environ()
+	if filepath.IsAbs(gs.cmd) {
+		cmdDir := filepath.Dir(gs.cmd)
+		if cmdDir != "" {
+			curPath := ""
+			for _, item := range env {
+				if strings.HasPrefix(item, "PATH=") {
+					curPath = strings.TrimPrefix(item, "PATH=")
+					break
+				}
+			}
+			pathValue := cmdDir
+			if curPath != "" {
+				pathValue += string(filepath.ListSeparator) + curPath
+			}
+			env = core.MergeEnv(env, []string{"PATH=" + pathValue})
+		}
+	}
 	if len(gs.extraEnv) > 0 {
 		env = core.MergeEnv(env, gs.extraEnv)
 	}
-	cmd.Env = env
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("geminiSession: stdin pipe: %w", err)
-	}
-	gs.stdin = stdin
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("geminiSession: stdout pipe: %w", err)
-	}
-
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("geminiSession: start: %w", err)
-	}
-
-	gs.wg.Add(1)
-	go func() {
-		defer gs.wg.Done()
-		defer func() {
-			gs.alive.Store(false)
-			if err := cmd.Wait(); err != nil {
-				stderrMsg := strings.TrimSpace(stderrBuf.String())
-				if stderrMsg != "" {
-					slog.Error("geminiSession: process failed", "error", err, "stderr", stderrMsg)
-					select {
-					case gs.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}:
-					case <-gs.ctx.Done():
-					}
-				}
-			}
-			gs.cancel()
-		}()
-		gs.readLoop(stdout)
-	}()
-
-	return nil
+	return env
 }
 
 func (gs *geminiSession) Send(prompt string, images []core.ImageAttachment) error {
 	if !gs.alive.Load() {
 		return fmt.Errorf("session is closed")
+	}
+	for {
+		gs.turnMu.Lock()
+		if !gs.turnActive {
+			gs.turnActive = true
+			gs.turnMu.Unlock()
+			break
+		}
+		gs.turnMu.Unlock()
+
+		select {
+		case <-gs.ctx.Done():
+			return fmt.Errorf("session is closed")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	releaseTurn := func() {
+		gs.turnMu.Lock()
+		gs.turnActive = false
+		gs.turnMu.Unlock()
 	}
 
 	// Gemini CLI supports @file references for images; save to temp files
@@ -187,22 +181,100 @@ func (gs *geminiSession) Send(prompt string, images []core.ImageAttachment) erro
 	gs.enqueueTempFiles(imageRefs)
 	gs.startTurnTimer()
 
-	_, err := fmt.Fprintln(gs.stdin, fullPrompt)
+	args := gs.buildArgs()
+	slog.Debug("geminiSession: launching turn process", "args", core.RedactArgs(args))
+
+	cmd := exec.CommandContext(gs.ctx, gs.cmd, args...)
+	cmd.Dir = gs.workDir
+	cmd.Env = gs.buildEnv()
+
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		gs.finishTurn(false)
-		return fmt.Errorf("geminiSession: write to stdin: %w", err)
+		releaseTurn()
+		return fmt.Errorf("geminiSession: stdin pipe: %w", err)
 	}
 
-	// Note: We don't clean up imageRefs immediately because the process
-	// might still be reading them. They will be cleaned up on process exit
-	// or we could add a timer if needed.
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		gs.finishTurn(false)
+		releaseTurn()
+		_ = stdin.Close()
+		return fmt.Errorf("geminiSession: stdout pipe: %w", err)
+	}
+
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		gs.finishTurn(false)
+		releaseTurn()
+		_ = stdin.Close()
+		return fmt.Errorf("geminiSession: start: %w", err)
+	}
+
+	if _, err := io.WriteString(stdin, fullPrompt+"\n"); err != nil {
+		gs.finishTurn(false)
+		releaseTurn()
+		_ = stdin.Close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("geminiSession: write to stdin: %w", err)
+	}
+	if err := stdin.Close(); err != nil {
+		gs.finishTurn(false)
+		releaseTurn()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("geminiSession: close stdin: %w", err)
+	}
+
+	gs.wg.Add(1)
+	go func() {
+		defer gs.wg.Done()
+		defer releaseTurn()
+
+		sawTerminal := gs.readLoop(stdout)
+		err := cmd.Wait()
+		if !sawTerminal {
+			gs.finishTurn(true)
+		}
+		if gs.ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			stderrMsg := strings.TrimSpace(stderrBuf.String())
+			if stderrMsg != "" {
+				slog.Error("geminiSession: process failed", "error", err, "stderr", stderrMsg)
+				select {
+				case gs.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}:
+				case <-gs.ctx.Done():
+				}
+				return
+			}
+			if !sawTerminal {
+				select {
+				case gs.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("geminiSession: process exited: %w", err)}:
+				case <-gs.ctx.Done():
+				}
+			}
+			return
+		}
+		if !sawTerminal {
+			select {
+			case gs.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("geminiSession: process exited without response")}:
+			case <-gs.ctx.Done():
+			}
+		}
+	}()
 
 	return nil
 }
 
-func (gs *geminiSession) readLoop(stdout io.ReadCloser) {
+func (gs *geminiSession) readLoop(stdout io.ReadCloser) bool {
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	sawTerminal := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -218,6 +290,10 @@ func (gs *geminiSession) readLoop(stdout io.ReadCloser) {
 			continue
 		}
 
+		switch raw["type"] {
+		case "error", "result":
+			sawTerminal = true
+		}
 		gs.handleEvent(raw)
 	}
 
@@ -228,7 +304,9 @@ func (gs *geminiSession) readLoop(stdout io.ReadCloser) {
 		case gs.events <- evt:
 		case <-gs.ctx.Done():
 		}
+		sawTerminal = true
 	}
+	return sawTerminal
 }
 
 // Gemini CLI stream-json event types:
@@ -422,22 +500,7 @@ func (gs *geminiSession) handleResult(raw map[string]any) {
 }
 
 func (gs *geminiSession) RespondPermission(requestID string, result core.PermissionResult) error {
-	if !gs.alive.Load() {
-		return fmt.Errorf("session is closed")
-	}
-
-	// Gemini CLI expects the permission result as a JSON object on stdin
-	data, err := json.Marshal(result)
-	if err != nil {
-		return fmt.Errorf("geminiSession: marshal permission result: %w", err)
-	}
-
-	_, err = fmt.Fprintln(gs.stdin, string(data))
-	if err != nil {
-		return fmt.Errorf("geminiSession: write permission to stdin: %w", err)
-	}
-
-	return nil
+	return fmt.Errorf("geminiSession: permission responses are not supported in non-interactive mode")
 }
 
 func (gs *geminiSession) Events() <-chan core.Event {
@@ -457,9 +520,6 @@ func (gs *geminiSession) Close() error {
 	gs.alive.Store(false)
 	gs.stopTurnTimer()
 	gs.cleanupAllTempFiles()
-	if gs.stdin != nil {
-		gs.stdin.Close()
-	}
 	gs.cancel()
 	done := make(chan struct{})
 	go func() {

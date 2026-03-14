@@ -42,6 +42,12 @@ type storedReplyText struct {
 	expiresAt time.Time
 }
 
+type storedIncomingReplyReference struct {
+	replyToMessageID string
+	replyToContent   string
+	expiresAt        time.Time
+}
+
 var telegramReplyRegistry = struct {
 	mu     sync.Mutex
 	byChat map[int64]map[int]storedReplyText
@@ -49,7 +55,18 @@ var telegramReplyRegistry = struct {
 	byChat: make(map[int64]map[int]storedReplyText),
 }
 
-const telegramReplyRegistryTTL = 24 * time.Hour
+var telegramIncomingReplyRegistry = struct {
+	mu     sync.Mutex
+	byChat map[int64]map[int]storedIncomingReplyReference
+}{
+	byChat: make(map[int64]map[int]storedIncomingReplyReference),
+}
+
+const (
+	telegramReplyRegistryTTL           = 24 * time.Hour
+	telegramIncomingReplyLookupTimeout = 300 * time.Millisecond
+	telegramIncomingReplyLookupStep    = 10 * time.Millisecond
+)
 
 func New(opts map[string]any) (core.Platform, error) {
 	token, _ := opts["token"].(string)
@@ -147,6 +164,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 					slog.Debug("telegram: message from unauthorized user", "user", userID)
 					continue
 				}
+				storeTelegramIncomingReplyReference(msg)
 
 				isGroup := msg.Chat.Type == "group" || msg.Chat.Type == "supergroup"
 
@@ -378,26 +396,40 @@ func (p *Platform) handleCallbackQuery(cb *tgbotapi.CallbackQuery) {
 
 // isDirectedAtBot checks whether a group message is directed at this bot:
 //   - Command with @thisbot suffix (e.g. /help@thisbot)
-//   - Command without @suffix (broadcast to all bots — accept it)
+//   - Most commands without @suffix are broadcast to all bots
+//   - Cross-bot relay commands (/sendto, /quote, /fwd) require an explicit target
 //   - Command with @otherbot suffix → reject
 //   - Non-command: accept if bot is @mentioned or message is a reply to bot
 func (p *Platform) isDirectedAtBot(msg *tgbotapi.Message) bool {
 	botName := p.bot.Self.UserName
+	commandText := telegramCommandText(msg)
 
 	// Commands: /cmd or /cmd@botname
 	if msg.IsCommand() {
-		atIdx := strings.Index(msg.Text, "@")
-		spaceIdx := strings.Index(msg.Text, " ")
-		cmdEnd := len(msg.Text)
+		cmdName := telegramCommandName(commandText)
+		if isTelegramCrossBotCommand(cmdName) {
+			target, ok := telegramExplicitCommandTarget(commandText)
+			if !ok {
+				slog.Debug("telegram: cross-bot command without explicit target, rejecting", "bot", botName, "text", commandText)
+				return false
+			}
+			match := strings.EqualFold(target, botName)
+			slog.Debug("telegram: cross-bot command target", "bot", botName, "cmd", cmdName, "target", target, "match", match)
+			return match
+		}
+
+		atIdx := strings.Index(commandText, "@")
+		spaceIdx := strings.Index(commandText, " ")
+		cmdEnd := len(commandText)
 		if spaceIdx > 0 {
 			cmdEnd = spaceIdx
 		}
 		if atIdx > 0 && atIdx < cmdEnd {
-			target := msg.Text[atIdx+1 : cmdEnd]
+			target := commandText[atIdx+1 : cmdEnd]
 			slog.Debug("telegram: command with @suffix", "bot", botName, "target", target, "match", strings.EqualFold(target, botName))
 			return strings.EqualFold(target, botName)
 		}
-		slog.Debug("telegram: command without @suffix, accepting", "bot", botName, "text", msg.Text)
+		slog.Debug("telegram: command without @suffix, accepting", "bot", botName, "text", commandText)
 		return true // /cmd without @suffix — accept
 	}
 
@@ -702,6 +734,59 @@ func splitTelegramMessage(text string, maxLen int) []string {
 	return chunks
 }
 
+func telegramCommandText(msg *tgbotapi.Message) string {
+	if msg == nil {
+		return ""
+	}
+	if strings.TrimSpace(msg.Text) != "" {
+		return strings.TrimSpace(msg.Text)
+	}
+	return strings.TrimSpace(msg.Caption)
+}
+
+func telegramCommandName(text string) string {
+	fields := strings.Fields(strings.TrimSpace(text))
+	if len(fields) == 0 || !strings.HasPrefix(fields[0], "/") {
+		return ""
+	}
+	cmd := strings.TrimPrefix(fields[0], "/")
+	if at := strings.Index(cmd, "@"); at >= 0 {
+		cmd = cmd[:at]
+	}
+	return strings.ToLower(cmd)
+}
+
+func isTelegramCrossBotCommand(cmd string) bool {
+	switch cmd {
+	case "sendto", "quote", "fwd":
+		return true
+	default:
+		return false
+	}
+}
+
+func telegramExplicitCommandTarget(text string) (string, bool) {
+	fields := strings.Fields(strings.TrimSpace(text))
+	if len(fields) == 0 || !strings.HasPrefix(fields[0], "/") {
+		return "", false
+	}
+
+	first := strings.TrimPrefix(fields[0], "/")
+	if at := strings.Index(first, "@"); at >= 0 && at+1 < len(first) {
+		return first[at+1:], true
+	}
+
+	if !isTelegramCrossBotCommand(telegramCommandName(text)) || len(fields) < 2 {
+		return "", false
+	}
+
+	target := strings.TrimSpace(fields[1])
+	if strings.HasPrefix(target, "@") && len(target) > 1 {
+		return strings.TrimPrefix(target, "@"), true
+	}
+	return "", false
+}
+
 func storeTelegramReplyGroup(chatID int64, messageIDs []int, fullText string) {
 	if len(messageIDs) == 0 || strings.TrimSpace(fullText) == "" {
 		return
@@ -722,6 +807,33 @@ func storeTelegramReplyGroup(chatID int64, messageIDs []int, fullText string) {
 	}
 }
 
+func storeTelegramIncomingReplyReference(msg *tgbotapi.Message) {
+	replyToMessageID, replyToContent := telegramDirectReplyReference(msg)
+	if replyToMessageID == "" && replyToContent == "" {
+		return
+	}
+	if msg == nil || msg.Chat == nil || msg.MessageID == 0 {
+		return
+	}
+
+	now := time.Now()
+	expiresAt := now.Add(telegramReplyRegistryTTL)
+
+	telegramIncomingReplyRegistry.mu.Lock()
+	defer telegramIncomingReplyRegistry.mu.Unlock()
+	cleanupTelegramIncomingReplyRegistryLocked(now)
+	perChat := telegramIncomingReplyRegistry.byChat[msg.Chat.ID]
+	if perChat == nil {
+		perChat = make(map[int]storedIncomingReplyReference)
+		telegramIncomingReplyRegistry.byChat[msg.Chat.ID] = perChat
+	}
+	perChat[msg.MessageID] = storedIncomingReplyReference{
+		replyToMessageID: replyToMessageID,
+		replyToContent:   replyToContent,
+		expiresAt:        expiresAt,
+	}
+}
+
 func resolveTelegramReplyGroup(chatID int64, messageID int) (string, bool) {
 	now := time.Now()
 	telegramReplyRegistry.mu.Lock()
@@ -738,6 +850,35 @@ func resolveTelegramReplyGroup(chatID int64, messageID int) (string, bool) {
 	return entry.fullText, true
 }
 
+func resolveTelegramIncomingReplyReference(chatID int64, messageID int) (storedIncomingReplyReference, bool) {
+	now := time.Now()
+	telegramIncomingReplyRegistry.mu.Lock()
+	defer telegramIncomingReplyRegistry.mu.Unlock()
+	cleanupTelegramIncomingReplyRegistryLocked(now)
+	perChat := telegramIncomingReplyRegistry.byChat[chatID]
+	if perChat == nil {
+		return storedIncomingReplyReference{}, false
+	}
+	entry, ok := perChat[messageID]
+	if !ok {
+		return storedIncomingReplyReference{}, false
+	}
+	return entry, true
+}
+
+func waitForTelegramIncomingReplyReference(chatID int64, messageID int, timeout time.Duration) (storedIncomingReplyReference, bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if entry, ok := resolveTelegramIncomingReplyReference(chatID, messageID); ok {
+			return entry, true
+		}
+		if time.Now().After(deadline) {
+			return storedIncomingReplyReference{}, false
+		}
+		time.Sleep(telegramIncomingReplyLookupStep)
+	}
+}
+
 func cleanupTelegramReplyRegistryLocked(now time.Time) {
 	for chatID, perChat := range telegramReplyRegistry.byChat {
 		for messageID, entry := range perChat {
@@ -751,21 +892,57 @@ func cleanupTelegramReplyRegistryLocked(now time.Time) {
 	}
 }
 
-func telegramReplyToMessageID(msg *tgbotapi.Message) string {
-	if msg.ReplyToMessage == nil {
-		return ""
+func cleanupTelegramIncomingReplyRegistryLocked(now time.Time) {
+	for chatID, perChat := range telegramIncomingReplyRegistry.byChat {
+		for messageID, entry := range perChat {
+			if now.After(entry.expiresAt) {
+				delete(perChat, messageID)
+			}
+		}
+		if len(perChat) == 0 {
+			delete(telegramIncomingReplyRegistry.byChat, chatID)
+		}
 	}
-	return strconv.Itoa(msg.ReplyToMessage.MessageID)
+}
+
+func telegramDirectReplyReference(msg *tgbotapi.Message) (string, string) {
+	if msg == nil || msg.ReplyToMessage == nil {
+		return "", ""
+	}
+	replyToContent := strings.TrimSpace(msg.ReplyToMessage.Text)
+	if replyToContent == "" {
+		replyToContent = strings.TrimSpace(msg.ReplyToMessage.Caption)
+	}
+	return strconv.Itoa(msg.ReplyToMessage.MessageID), replyToContent
+}
+
+func telegramReplyReference(msg *tgbotapi.Message) (string, string) {
+	replyToMessageID, replyToContent := telegramDirectReplyReference(msg)
+	if replyToMessageID != "" || replyToContent != "" {
+		return replyToMessageID, replyToContent
+	}
+	if msg == nil || msg.Chat == nil || msg.MessageID == 0 {
+		return "", ""
+	}
+	if entry, ok := resolveTelegramIncomingReplyReference(msg.Chat.ID, msg.MessageID); ok {
+		return entry.replyToMessageID, entry.replyToContent
+	}
+	if isTelegramCrossBotCommand(telegramCommandName(telegramCommandText(msg))) {
+		if entry, ok := waitForTelegramIncomingReplyReference(msg.Chat.ID, msg.MessageID, telegramIncomingReplyLookupTimeout); ok {
+			return entry.replyToMessageID, entry.replyToContent
+		}
+	}
+	return "", ""
+}
+
+func telegramReplyToMessageID(msg *tgbotapi.Message) string {
+	replyToMessageID, _ := telegramReplyReference(msg)
+	return replyToMessageID
 }
 
 func telegramReplyToContent(msg *tgbotapi.Message) string {
-	if msg.ReplyToMessage == nil {
-		return ""
-	}
-	if strings.TrimSpace(msg.ReplyToMessage.Text) != "" {
-		return msg.ReplyToMessage.Text
-	}
-	return strings.TrimSpace(msg.ReplyToMessage.Caption)
+	_, replyToContent := telegramReplyReference(msg)
+	return replyToContent
 }
 
 func truncateForLog(s string, maxLen int) string {

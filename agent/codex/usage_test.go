@@ -73,10 +73,89 @@ func TestGetCodexContextUsage_ParsesQuotaWindows(t *testing.T) {
 	if usage.PlanType != "plus" {
 		t.Fatalf("PlanType = %q, want plus", usage.PlanType)
 	}
-	if usage.DailyQuota == nil || usage.DailyQuota.WindowMinutes != 300 || usage.DailyQuota.UsedPercent != 2 {
-		t.Fatalf("DailyQuota = %#v, want 300 min / 2%%", usage.DailyQuota)
+	if usage.DailyQuota != nil {
+		t.Fatalf("DailyQuota = %#v, want nil for non-daily 300 min window", usage.DailyQuota)
 	}
-	if usage.WeeklyQuota == nil || usage.WeeklyQuota.WindowMinutes != 10080 || usage.WeeklyQuota.UsedPercent != 3 {
-		t.Fatalf("WeeklyQuota = %#v, want 10080 min / 3%%", usage.WeeklyQuota)
+	if usage.WeeklyQuota == nil || usage.WeeklyQuota.WindowMinutes != 10080 || usage.WeeklyQuota.UsedPercent != 90 {
+		t.Fatalf("WeeklyQuota = %#v, want 10080 min / 90%% display", usage.WeeklyQuota)
+	}
+	if len(usage.OtherQuotas) != 1 || usage.OtherQuotas[0].Label != "primary" || usage.OtherQuotas[0].WindowMinutes != 300 || usage.OtherQuotas[0].UsedPercent != 90 {
+		t.Fatalf("OtherQuotas = %#v, want primary 300 min / 90%% display", usage.OtherQuotas)
+	}
+}
+
+func TestGetCodexContextUsage_UsesLatestGlobalRateLimits(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("CODEX_HOME", filepath.Join(homeDir, ".codex"))
+
+	sessionID := "session-local"
+	sessionsDir := filepath.Join(homeDir, ".codex", "sessions", "2026", "03", "11")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	localPath := filepath.Join(sessionsDir, "rollout-"+sessionID+".jsonl")
+	localData := "" +
+		"{\"timestamp\":\"2026-03-11T12:58:46Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"" + sessionID + "\",\"cwd\":\"/tmp\"}}\n" +
+		"{\"timestamp\":\"2026-03-11T12:59:45Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":333,\"output_tokens\":44,\"total_tokens\":377}},\"rate_limits\":{\"primary\":{\"used_percent\":94.0,\"window_minutes\":300,\"resets_at\":1773250997},\"secondary\":{\"used_percent\":98.0,\"window_minutes\":10081,\"resets_at\":1773815495},\"plan_type\":\"plus\"}}}\n"
+	if err := os.WriteFile(localPath, []byte(localData), 0o644); err != nil {
+		t.Fatalf("WriteFile local: %v", err)
+	}
+
+	globalPath := filepath.Join(sessionsDir, "rollout-global.jsonl")
+	globalData := "" +
+		"{\"timestamp\":\"2026-03-11T14:13:00.899Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}},\"rate_limits\":{\"primary\":{\"used_percent\":18.0,\"window_minutes\":300,\"resets_at\":1773250997},\"secondary\":{\"used_percent\":8.0,\"window_minutes\":10081,\"resets_at\":1773815495},\"plan_type\":\"plus\"}}}\n"
+	if err := os.WriteFile(globalPath, []byte(globalData), 0o644); err != nil {
+		t.Fatalf("WriteFile global: %v", err)
+	}
+
+	usage, err := getCodexContextUsage(sessionID)
+	if err != nil {
+		t.Fatalf("getCodexContextUsage: %v", err)
+	}
+	if usage.WeeklyQuota == nil || usage.WeeklyQuota.UsedPercent != 90 {
+		t.Fatalf("WeeklyQuota = %#v, want global 90", usage.WeeklyQuota)
+	}
+	if len(usage.OtherQuotas) == 0 || usage.OtherQuotas[0].UsedPercent != 80 {
+		t.Fatalf("OtherQuotas = %#v, want global primary 80", usage.OtherQuotas)
+	}
+}
+
+func TestGetCodexContextUsage_PrefersNewerSessionRateLimits(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("CODEX_HOME", filepath.Join(homeDir, ".codex"))
+
+	sessionID := "session-newer-local"
+	sessionsDir := filepath.Join(homeDir, ".codex", "sessions", "2026", "03", "11")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	localPath := filepath.Join(sessionsDir, "rollout-"+sessionID+".jsonl")
+	localData := "" +
+		"{\"timestamp\":\"2026-03-11T15:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"" + sessionID + "\",\"cwd\":\"/tmp\"}}\n" +
+		"{\"timestamp\":\"2026-03-11T15:10:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":333,\"output_tokens\":44,\"total_tokens\":377}},\"rate_limits\":{\"primary\":{\"used_percent\":12.0,\"window_minutes\":300,\"resets_at\":1773254597},\"secondary\":{\"used_percent\":24.0,\"window_minutes\":10081,\"resets_at\":1773819095},\"plan_type\":\"plus\"}}}\n"
+	if err := os.WriteFile(localPath, []byte(localData), 0o644); err != nil {
+		t.Fatalf("WriteFile local: %v", err)
+	}
+
+	globalPath := filepath.Join(sessionsDir, "rollout-global.jsonl")
+	globalData := "" +
+		"{\"timestamp\":\"2026-03-10T23:59:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}},\"rate_limits\":{\"primary\":{\"used_percent\":88.0,\"window_minutes\":300,\"resets_at\":1773200000},\"secondary\":{\"used_percent\":92.0,\"window_minutes\":10081,\"resets_at\":1773760000},\"plan_type\":\"plus\"}}}\n"
+	if err := os.WriteFile(globalPath, []byte(globalData), 0o644); err != nil {
+		t.Fatalf("WriteFile global: %v", err)
+	}
+
+	usage, err := getCodexContextUsage(sessionID)
+	if err != nil {
+		t.Fatalf("getCodexContextUsage: %v", err)
+	}
+	if usage.WeeklyQuota == nil || usage.WeeklyQuota.UsedPercent != 70 {
+		t.Fatalf("WeeklyQuota = %#v, want local 70", usage.WeeklyQuota)
+	}
+	if len(usage.OtherQuotas) == 0 || usage.OtherQuotas[0].UsedPercent != 80 {
+		t.Fatalf("OtherQuotas = %#v, want local primary 80", usage.OtherQuotas)
 	}
 }

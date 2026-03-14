@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -228,6 +229,30 @@ func (s *stubCaptureSession) CurrentSessionID() string                          
 func (s *stubCaptureSession) Alive() bool                                          { return true }
 func (s *stubCaptureSession) Close() error                                         { return nil }
 
+type stubBlockingAgent struct {
+	stubAgent
+}
+
+func (a *stubBlockingAgent) StartSession(ctx context.Context, _ string) (AgentSession, error) {
+	ch := make(chan Event)
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+	return &stubBlockingSession{events: ch}, nil
+}
+
+type stubBlockingSession struct {
+	events chan Event
+}
+
+func (s *stubBlockingSession) Send(_ string, _ []ImageAttachment) error             { return nil }
+func (s *stubBlockingSession) RespondPermission(_ string, _ PermissionResult) error { return nil }
+func (s *stubBlockingSession) Events() <-chan Event                                 { return s.events }
+func (s *stubBlockingSession) CurrentSessionID() string                             { return "blocking-session" }
+func (s *stubBlockingSession) Alive() bool                                          { return true }
+func (s *stubBlockingSession) Close() error                                         { return nil }
+
 func newTestEngine() *Engine {
 	return NewEngine("test", &stubAgent{}, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
 }
@@ -451,6 +476,52 @@ func TestQuietGlobalToggle(t *testing.T) {
 	e.quietMu.RUnlock()
 	if q {
 		t.Fatal("expected global quiet to be false after second toggle")
+	}
+}
+
+func TestQuietGlobalToggle_PersistsWhenSaveFuncIsConfigured(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+
+	var saved []bool
+	e.SetGlobalQuietSaveFunc(func(quiet bool) error {
+		saved = append(saved, quiet)
+		return nil
+	})
+
+	e.cmdQuiet(p, msg, []string{"global"})
+
+	if len(saved) != 1 || !saved[0] {
+		t.Fatalf("saved = %v, want [true]", saved)
+	}
+	e.quietMu.RLock()
+	q := e.quiet
+	e.quietMu.RUnlock()
+	if !q {
+		t.Fatal("expected global quiet to be true")
+	}
+}
+
+func TestQuietGlobalToggle_SaveFailureKeepsRuntimeState(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+
+	e.SetGlobalQuietSaveFunc(func(bool) error {
+		return errors.New("save failed")
+	})
+
+	e.cmdQuiet(p, msg, []string{"global"})
+
+	e.quietMu.RLock()
+	q := e.quiet
+	e.quietMu.RUnlock()
+	if q {
+		t.Fatal("expected global quiet to remain false")
+	}
+	if len(p.sent) != 1 || !strings.Contains(p.sent[0], "save failed") {
+		t.Fatalf("sent = %v, want save failure message", p.sent)
 	}
 }
 
@@ -784,6 +855,80 @@ func TestCmdReasoning_SwitchesEffortAndResetsSession(t *testing.T) {
 	}
 }
 
+func TestCmdModel_PersistsSelectedModel(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubModelModeAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+
+	var saved string
+	e.SetModelSaveFunc(func(model string) error {
+		saved = model
+		return nil
+	})
+
+	e.cmdModel(p, msg, []string{"2"})
+
+	if saved != "gpt-4.1-mini" {
+		t.Fatalf("saved model = %q, want %q", saved, "gpt-4.1-mini")
+	}
+	if agent.model != "gpt-4.1-mini" {
+		t.Fatalf("agent model = %q, want %q", agent.model, "gpt-4.1-mini")
+	}
+}
+
+func TestCmdModel_SaveFailurePreventsRuntimeChange(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubModelModeAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+
+	s := e.sessions.GetOrCreateActive(msg.SessionKey)
+	s.AgentSessionID = "existing-session"
+	s.AddHistory("user", "hello")
+
+	e.SetModelSaveFunc(func(string) error {
+		return errors.New("save failed")
+	})
+
+	e.cmdModel(p, msg, []string{"gpt-4.1"})
+
+	if agent.model != "" {
+		t.Fatalf("agent model = %q, want unchanged empty", agent.model)
+	}
+	if s.AgentSessionID != "existing-session" {
+		t.Fatalf("AgentSessionID = %q, want unchanged existing-session", s.AgentSessionID)
+	}
+	if len(s.History) != 1 {
+		t.Fatalf("history length = %d, want 1", len(s.History))
+	}
+	if len(p.sent) != 1 || !strings.Contains(p.sent[0], "save failed") {
+		t.Fatalf("sent = %v, want save failure message", p.sent)
+	}
+}
+
+func TestCmdReasoning_PersistsSelectedEffort(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubModelModeAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+
+	var saved string
+	e.SetReasoningSaveFunc(func(effort string) error {
+		saved = effort
+		return nil
+	})
+
+	e.cmdReasoning(p, msg, []string{"4"})
+
+	if saved != "xhigh" {
+		t.Fatalf("saved reasoning = %q, want %q", saved, "xhigh")
+	}
+	if agent.reasoningEffort != "xhigh" {
+		t.Fatalf("reasoning effort = %q, want %q", agent.reasoningEffort, "xhigh")
+	}
+}
+
 func TestCmdReasoning_RejectsMinimal(t *testing.T) {
 	p := &stubPlatformEngine{n: "plain"}
 	agent := &stubModelModeAgent{}
@@ -830,6 +975,31 @@ func TestCmdStatus_UsesLegacyTextOnPlatformWithoutCardSupport(t *testing.T) {
 	}
 	if strings.Contains(p.sent[0], "[← Back]") {
 		t.Fatalf("status text = %q, should not be card fallback text", p.sent[0])
+	}
+}
+
+func TestCmdList_FallsBackToLocalSessionsWhenAgentReturnsEmpty(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "test:user-list", ReplyCtx: "ctx"}
+
+	s1 := e.sessions.NewSession(msg.SessionKey, "alpha")
+	s1.AgentSessionID = "agent-alpha"
+	s1.AddHistory("user", "hello")
+	s1.UpdatedAt = time.Now().Add(-time.Minute)
+
+	s2 := e.sessions.NewSession(msg.SessionKey, "beta")
+	s2.AgentSessionID = "agent-beta"
+	s2.AddHistory("user", "world")
+	s2.UpdatedAt = time.Now()
+
+	e.cmdList(p, msg, nil)
+
+	if len(p.sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(p.sent))
+	}
+	if !strings.Contains(p.sent[0], "beta") || !strings.Contains(p.sent[0], "alpha") {
+		t.Fatalf("list text = %q, want fallback local session names", p.sent[0])
 	}
 }
 
@@ -888,10 +1058,10 @@ func TestCmdUsage_ShowsQuotaDetailsWhenAvailable(t *testing.T) {
 	if !strings.Contains(p.sent[0], "Plan: **plus**") {
 		t.Fatalf("usage text = %q, want plan line", p.sent[0])
 	}
-	if !strings.Contains(p.sent[0], "Daily Quota: **2.0%**") || !strings.Contains(p.sent[0], "Resets in: **") {
+	if !strings.Contains(p.sent[0], "Daily Quota: **2.0%**") || !strings.Contains(p.sent[0], "5h window") || !strings.Contains(p.sent[0], "Resets in: **") {
 		t.Fatalf("usage text = %q, want daily quota line", p.sent[0])
 	}
-	if !strings.Contains(p.sent[0], "Weekly Quota: **3.0%**") || !strings.Contains(p.sent[0], "□□□□") {
+	if !strings.Contains(p.sent[0], "Weekly Quota: **3.0%**") || !strings.Contains(p.sent[0], "7d window") || !strings.Contains(p.sent[0], "□□□□") {
 		t.Fatalf("usage text = %q, want weekly quota line", p.sent[0])
 	}
 }
@@ -900,6 +1070,50 @@ func TestBuildSendToPrompt(t *testing.T) {
 	got := buildSendToPrompt("alpha", "please summarize")
 	if !strings.Contains(got, "Forwarded message:\n\nalpha") || !strings.Contains(got, "User request:\nplease summarize") {
 		t.Fatalf("prompt = %q, want forwarded message + user request", got)
+	}
+}
+
+func TestBuildSendToPrompt_StripsNestedForwardingWrappers(t *testing.T) {
+	got := buildSendToPrompt("[codex → iflow] Forwarded message:\n\n转发内容：\n\nalpha", "continue")
+	if strings.Contains(got, "[codex → iflow]") || strings.Contains(got, "转发内容") {
+		t.Fatalf("prompt = %q, want wrappers stripped", got)
+	}
+	if !strings.Contains(got, "Forwarded message:\n\nalpha") {
+		t.Fatalf("prompt = %q, want normalized forwarded body", got)
+	}
+}
+
+func TestExtractSendToArgs_EmbeddedCommandPreservesPrefixAsInstruction(t *testing.T) {
+	args, ok := extractSendToArgs("记录一下 /sendto @bz_iflow_bot")
+	if !ok {
+		t.Fatal("expected embedded /sendto to be detected")
+	}
+	if len(args) != 2 || args[0] != "@bz_iflow_bot" || args[1] != "记录一下" {
+		t.Fatalf("args = %#v, want [@bz_iflow_bot 记录一下]", args)
+	}
+}
+
+func TestResolveSendToTarget_ByMentionSubstring(t *testing.T) {
+	e := NewEngine("codex", &stubAgent{}, nil, "", LangEnglish)
+	rm := NewRelayManager("")
+	rm.RegisterEngine("codex", e)
+	rm.RegisterEngine("iflow", &Engine{name: "iflow"})
+	e.SetRelayManager(rm)
+
+	if got := e.resolveSendToTarget("telegram:123:456", []string{"@bz_iflow_bot", "记录一下"}); got != "iflow" {
+		t.Fatalf("resolveSendToTarget = %q, want iflow", got)
+	}
+}
+
+func TestResolveSendToTarget_ByExactTelegramBotStyleName(t *testing.T) {
+	e := NewEngine("codex", &stubAgent{}, nil, "", LangEnglish)
+	rm := NewRelayManager("")
+	rm.RegisterEngine("codex", e)
+	rm.RegisterEngine("iflow", &Engine{name: "iflow"})
+	e.SetRelayManager(rm)
+
+	if got := e.resolveSendToTarget("telegram:123:456", []string{"@bz_iflow_bot"}); got != "iflow" {
+		t.Fatalf("resolveSendToTarget exact = %q, want iflow", got)
 	}
 }
 
@@ -944,6 +1158,29 @@ func TestCmdSendTo_RequiresReply(t *testing.T) {
 	}
 }
 
+func TestCmdSendTo_UsesReplyContentWithoutReplyID(t *testing.T) {
+	p := &stubReplyResolverPlatform{stubPlatformEngine: stubPlatformEngine{n: "plain"}}
+	agent := &stubCaptureAgent{prompts: make(chan string, 1)}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{
+		SessionKey:     "test:user-sendto-fallback",
+		ReplyCtx:       "ctx",
+		ReplyToContent: "chunk content from telegram",
+		Content:        "/sendto continue",
+	}
+
+	e.cmdSendTo(p, msg, []string{"continue"})
+
+	select {
+	case prompt := <-agent.prompts:
+		if !strings.Contains(prompt, "chunk content from telegram") {
+			t.Fatalf("prompt = %q, want reply content fallback", prompt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for forwarded prompt")
+	}
+}
+
 func TestCmdSendTo_RateLimitedPerChat(t *testing.T) {
 	p := &stubReplyResolverPlatform{
 		stubPlatformEngine: stubPlatformEngine{n: "plain"},
@@ -975,6 +1212,67 @@ func TestCmdSendTo_RateLimitedPerChat(t *testing.T) {
 	}
 }
 
+func TestHandleRelay_RespectsContextTimeoutWithoutEvents(t *testing.T) {
+	e := NewEngine("gemini", &stubBlockingAgent{}, []Platform{}, "", LangEnglish)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := e.HandleRelay(ctx, "iflow", "123", "hello")
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Fatalf("err = %v, want deadline exceeded", err)
+	}
+}
+
+func TestFormatUsageWindow_RoundsNearWholeWindows(t *testing.T) {
+	if got := formatUsageWindow(300); got != "5h" {
+		t.Fatalf("formatUsageWindow(300) = %q, want 5h", got)
+	}
+	if got := formatUsageWindow(10081); got != "7d" {
+		t.Fatalf("formatUsageWindow(10081) = %q, want 7d", got)
+	}
+}
+
+func TestCmdUsage_ShowsPrimaryQuotaBeforeWeekly(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubUsageAgent{
+		usage: &ContextUsage{
+			PromptTokens:     10,
+			CompletionTokens: 2,
+			TotalTokens:      12,
+			WeeklyQuota: &UsageQuota{
+				Label:         "weekly",
+				UsedPercent:   90,
+				WindowMinutes: 10081,
+			},
+			OtherQuotas: []UsageQuota{
+				{Label: "primary", UsedPercent: 80, WindowMinutes: 300},
+			},
+		},
+	}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "test:user3", ReplyCtx: "ctx"}
+	s := e.sessions.GetOrCreateActive(msg.SessionKey)
+	s.AgentSessionID = "usage-session"
+
+	e.cmdUsage(p, msg)
+
+	if len(p.sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(p.sent))
+	}
+	text := p.sent[0]
+	primaryIdx := strings.Index(text, "Primary quota")
+	weeklyIdx := strings.Index(text, "Weekly Quota")
+	if primaryIdx < 0 || weeklyIdx < 0 {
+		t.Fatalf("usage text = %q, want primary and weekly quota", text)
+	}
+	if primaryIdx > weeklyIdx {
+		t.Fatalf("usage text = %q, want primary quota before weekly quota", text)
+	}
+}
+
 func TestCmdCommands_UsesLegacyTextOnPlatformWithoutCardSupport(t *testing.T) {
 	p := &stubPlatformEngine{n: "plain"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -990,6 +1288,32 @@ func TestCmdCommands_UsesLegacyTextOnPlatformWithoutCardSupport(t *testing.T) {
 	}
 	if strings.Contains(p.sent[0], "[← Back]") {
 		t.Fatalf("commands text = %q, should not be card fallback text", p.sent[0])
+	}
+}
+
+func TestGetMenuCommands_TelegramUsesCuratedSubset(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, []Platform{&stubPlatformEngine{n: "telegram"}}, "", LangEnglish)
+	e.AddCommand("deploy", "Deploy app", "ship it", "", "", "config")
+
+	cmds := e.GetMenuCommands("telegram")
+	names := make(map[string]struct{}, len(cmds))
+	for _, c := range cmds {
+		names[c.Command] = struct{}{}
+	}
+
+	for _, want := range []string{"help", "new", "list", "current", "model", "reasoning", "mode", "usage", "bind", "status"} {
+		if _, ok := names[want]; !ok {
+			t.Fatalf("telegram menu missing %q: %v", want, cmds)
+		}
+	}
+	if _, ok := names["sendto"]; ok {
+		t.Fatalf("telegram menu should not include sendto: %v", cmds)
+	}
+	if _, ok := names["deploy"]; ok {
+		t.Fatalf("telegram menu should not include custom command deploy: %v", cmds)
+	}
+	if _, ok := names["provider"]; ok {
+		t.Fatalf("telegram menu should not include advanced command provider: %v", cmds)
 	}
 }
 

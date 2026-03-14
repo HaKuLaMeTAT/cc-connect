@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -211,7 +212,7 @@ func getCodexContextUsage(sessionID string) (*core.ContextUsage, error) {
 	defer f.Close()
 
 	usage := &core.ContextUsage{}
-	var lastRateLimits *codexRateLimits
+	var sessionRateLimits codexRateLimitsSnapshot
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 256*1024), 1024*1024)
@@ -223,8 +224,9 @@ func getCodexContextUsage(sessionID string) (*core.ContextUsage, error) {
 		}
 
 		var raw struct {
-			Type    string          `json:"type"`
-			Payload json.RawMessage `json:"payload"`
+			Timestamp string          `json:"timestamp"`
+			Type      string          `json:"type"`
+			Payload   json.RawMessage `json:"payload"`
 		}
 		if json.Unmarshal([]byte(line), &raw) != nil || raw.Type != "event_msg" {
 			continue
@@ -250,14 +252,23 @@ func getCodexContextUsage(sessionID string) (*core.ContextUsage, error) {
 		}
 
 		usage = usageFromTokenMap(tokens)
+		ts, _ := time.Parse(time.RFC3339Nano, raw.Timestamp)
 		if payload.RateLimits != nil {
-			lastRateLimits = payload.RateLimits
+			sessionRateLimits = codexRateLimitsSnapshot{
+				RateLimits: payload.RateLimits,
+				Timestamp:  ts,
+			}
 		}
-		applyCodexRateLimits(usage, lastRateLimits)
+		applyCodexRateLimits(usage, sessionRateLimits.RateLimits)
 	}
 
 	if err := scanner.Err(); err != nil {
 		return nil, err
+	}
+
+	globalRateLimits := latestCodexGlobalRateLimits()
+	if shouldApplyGlobalCodexRateLimits(globalRateLimits, sessionRateLimits) {
+		applyCodexRateLimits(usage, globalRateLimits.RateLimits)
 	}
 
 	return usage, nil
@@ -273,6 +284,11 @@ type codexRateLimitWindow struct {
 	UsedPercent   float64 `json:"used_percent"`
 	WindowMinutes int     `json:"window_minutes"`
 	ResetsAt      int64   `json:"resets_at"`
+}
+
+type codexRateLimitsSnapshot struct {
+	RateLimits *codexRateLimits
+	Timestamp  time.Time
 }
 
 func usageFromTokenMap(tokens map[string]any) *core.ContextUsage {
@@ -320,6 +336,9 @@ func applyCodexRateLimits(usage *core.ContextUsage, limits *codexRateLimits) {
 	if usage == nil || limits == nil {
 		return
 	}
+	usage.DailyQuota = nil
+	usage.WeeklyQuota = nil
+	usage.OtherQuotas = nil
 	if limits.PlanType != "" {
 		usage.PlanType = limits.PlanType
 	}
@@ -337,16 +356,6 @@ func applyCodexRateLimits(usage *core.ContextUsage, limits *codexRateLimits) {
 
 	dailyIdx := findQuotaByWindow(windows, 18*60, 30*60)
 	weeklyIdx := findQuotaByWindow(windows, 6*24*60, 8*24*60)
-	if dailyIdx < 0 && weeklyIdx >= 0 {
-		for i, quota := range windows {
-			if i == weeklyIdx {
-				continue
-			}
-			if dailyIdx < 0 || quota.WindowMinutes < windows[dailyIdx].WindowMinutes {
-				dailyIdx = i
-			}
-		}
-	}
 
 	used := make(map[int]struct{}, 2)
 	if dailyIdx >= 0 {
@@ -369,12 +378,27 @@ func quotaFromCodexWindow(label string, window *codexRateLimitWindow) core.Usage
 	quota := core.UsageQuota{
 		Label:         label,
 		WindowMinutes: window.WindowMinutes,
-		UsedPercent:   window.UsedPercent,
+		UsedPercent:   codexQuotaDisplayPercent(window.UsedPercent),
 	}
 	if window.ResetsAt > 0 {
 		quota.ResetsAt = time.Unix(window.ResetsAt, 0)
 	}
 	return quota
+}
+
+func codexQuotaDisplayPercent(usedPercent float64) float64 {
+	remaining := 100 - usedPercent
+	if remaining < 0 {
+		remaining = 0
+	}
+	if remaining >= 100 {
+		return 100
+	}
+	bucket := math.Floor(remaining/10.0) * 10
+	if bucket == 0 && remaining > 0 {
+		return 10
+	}
+	return bucket
 }
 
 func findQuotaByWindow(quotas []core.UsageQuota, minMinutes, maxMinutes int) int {
@@ -384,6 +408,92 @@ func findQuotaByWindow(quotas []core.UsageQuota, minMinutes, maxMinutes int) int
 		}
 	}
 	return -1
+}
+
+func shouldApplyGlobalCodexRateLimits(global, session codexRateLimitsSnapshot) bool {
+	if global.RateLimits == nil {
+		return false
+	}
+	if session.RateLimits == nil {
+		return true
+	}
+	if global.Timestamp.IsZero() || session.Timestamp.IsZero() {
+		return false
+	}
+	return global.Timestamp.After(session.Timestamp)
+}
+
+func latestCodexGlobalRateLimits() codexRateLimitsSnapshot {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return codexRateLimitsSnapshot{}
+	}
+	codexHome := os.Getenv("CODEX_HOME")
+	if codexHome == "" {
+		codexHome = filepath.Join(homeDir, ".codex")
+	}
+
+	var dirs []string
+	for _, dir := range []string{
+		filepath.Join(codexHome, "sessions"),
+		filepath.Join(codexHome, "archived_sessions"),
+	} {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			dirs = append(dirs, dir)
+		}
+	}
+
+	best := codexRateLimitsSnapshot{}
+	for _, dir := range dirs {
+		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() || !strings.HasSuffix(path, ".jsonl") {
+				return nil
+			}
+
+			f, err := os.Open(path)
+			if err != nil {
+				return nil
+			}
+			defer f.Close()
+
+			scanner := bufio.NewScanner(f)
+			scanner.Buffer(make([]byte, 256*1024), 1024*1024)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if line == "" {
+					continue
+				}
+				var raw struct {
+					Timestamp string          `json:"timestamp"`
+					Type      string          `json:"type"`
+					Payload   json.RawMessage `json:"payload"`
+				}
+				if json.Unmarshal([]byte(line), &raw) != nil || raw.Type != "event_msg" {
+					continue
+				}
+				var payload struct {
+					Type       string           `json:"type"`
+					RateLimits *codexRateLimits `json:"rate_limits"`
+				}
+				if json.Unmarshal(raw.Payload, &payload) != nil || payload.Type != "token_count" || payload.RateLimits == nil {
+					continue
+				}
+				ts, err := time.Parse(time.RFC3339Nano, raw.Timestamp)
+				if err != nil {
+					continue
+				}
+				if best.RateLimits == nil || ts.After(best.Timestamp) {
+					copy := *payload.RateLimits
+					best = codexRateLimitsSnapshot{
+						RateLimits: &copy,
+						Timestamp:  ts,
+					}
+				}
+			}
+			return nil
+		})
+	}
+	return best
 }
 
 // getSessionHistory reads the JSONL transcript and returns user/assistant messages.

@@ -13,6 +13,14 @@ import (
 )
 
 const relayTimeout = 120 * time.Second
+const geminiRelayTimeout = 5 * time.Minute
+
+func relayTimeoutForProject(project string) time.Duration {
+	if strings.EqualFold(project, "gemini") {
+		return geminiRelayTimeout
+	}
+	return relayTimeout
+}
 
 // RelayBinding represents a bot-to-bot relay binding in a group chat.
 type RelayBinding struct {
@@ -24,9 +32,9 @@ type RelayBinding struct {
 // RelayManager coordinates bot-to-bot message relay across engines.
 type RelayManager struct {
 	mu        sync.RWMutex
-	engines   map[string]*Engine         // project name → engine (runtime only)
-	bindings  map[string]*RelayBinding   // chatID → binding
-	storePath string                     // empty = no persistence
+	engines   map[string]*Engine       // project name → engine (runtime only)
+	bindings  map[string]*RelayBinding // chatID → binding
+	storePath string                   // empty = no persistence
 }
 
 func NewRelayManager(dataDir string) *RelayManager {
@@ -218,7 +226,7 @@ func (rm *RelayManager) Send(ctx context.Context, req RelayRequest) (*RelayRespo
 	}
 
 	// Execute relay: inject message into target engine and collect response
-	relayCtx, cancel := context.WithTimeout(ctx, relayTimeout)
+	relayCtx, cancel := context.WithTimeout(ctx, relayTimeoutForProject(req.To))
 	defer cancel()
 
 	response, err := targetEngine.HandleRelay(relayCtx, req.From, chatID, req.Message)

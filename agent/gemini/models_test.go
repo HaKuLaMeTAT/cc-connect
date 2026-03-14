@@ -44,7 +44,32 @@ func TestAvailableModels_IncludesSeenModels(t *testing.T) {
 	if _, ok := names["gemini-3.1-pro-preview"]; !ok {
 		t.Fatalf("models missing gemini-3.1-pro-preview: %v", models)
 	}
-	if _, ok := names["gemini-2.5-flash-lite"]; !ok {
-		t.Fatalf("models missing default gemini-2.5-flash-lite: %v", models)
+	if _, ok := names["gemini-1.5-flash"]; !ok {
+		if _, ok2 := names["gemini-2.0-flash"]; !ok2 {
+			t.Fatalf("models missing common Gemini fallback models: %v", models)
+		}
+	}
+}
+
+func TestExtractSessionSummary_HandlesGeminiContentShape(t *testing.T) {
+	sf := &sessionFile{
+		SessionID: "sid-1",
+		Messages: []struct {
+			Type   string `json:"type"`
+			Model  string `json:"model"`
+			Tokens *struct {
+				Input  int `json:"input"`
+				Output int `json:"output"`
+				Total  int `json:"total"`
+			} `json:"tokens"`
+			Content any `json:"content"`
+		}{
+			{Type: "user", Content: []any{map[string]any{"text": "hello world"}}},
+			{Type: "gemini", Content: "assistant reply"},
+		},
+	}
+
+	if got := extractSessionSummary(sf); got != "hello world" {
+		t.Fatalf("extractSessionSummary = %q, want hello world", got)
 	}
 }

@@ -400,8 +400,18 @@ func main() {
 			})
 		}
 
-		// Set up save callbacks for provider management
 		projName := proj.Name
+		engine.SetModelSaveFunc(func(model string) error {
+			return config.SaveProjectModel(projName, model)
+		})
+		engine.SetReasoningSaveFunc(func(effort string) error {
+			return config.SaveProjectReasoningEffort(projName, effort)
+		})
+		engine.SetGlobalQuietSaveFunc(func(quiet bool) error {
+			return config.SaveGlobalQuiet(quiet)
+		})
+
+		// Set up save callbacks for provider management
 		engine.SetProviderSaveFunc(func(providerName string) error {
 			return config.SaveActiveProvider(projName, providerName)
 		})
@@ -720,7 +730,7 @@ func setupLogger(level string, w io.Writer) {
 }
 
 // reloadConfig re-reads config.toml and applies hot-reloadable settings
-// (display, providers, commands) to the given engine.
+// (display, model, reasoning, providers, commands) to the given engine.
 func reloadConfig(configPath, projName string, engine *core.Engine) (*core.ConfigReloadResult, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -759,6 +769,16 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		engine.SetDefaultQuiet(*cfg.Quiet)
 	} else {
 		engine.SetDefaultQuiet(false)
+	}
+
+	if switcher, ok := engine.GetAgent().(core.ModelSwitcher); ok {
+		model, _ := proj.Agent.Options["model"].(string)
+		switcher.SetModel(strings.TrimSpace(model))
+	}
+
+	if switcher, ok := engine.GetAgent().(core.ReasoningEffortSwitcher); ok {
+		effort, _ := proj.Agent.Options["reasoning_effort"].(string)
+		switcher.SetReasoningEffort(strings.TrimSpace(effort))
 	}
 
 	// Reload providers

@@ -405,6 +405,8 @@ const (
 	MsgUsageCompletion     MsgKey = "usage_completion"
 	MsgUsageTotal          MsgKey = "usage_total"
 	MsgUsagePlan           MsgKey = "usage_plan"
+	MsgUsagePrimary        MsgKey = "usage_primary"
+	MsgUsageSecondary      MsgKey = "usage_secondary"
 	MsgUsageDaily          MsgKey = "usage_daily"
 	MsgUsageWeekly         MsgKey = "usage_weekly"
 	MsgUsageUsed           MsgKey = "usage_used"
@@ -2526,6 +2528,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "訂閱計劃",
 		LangJapanese:           "プラン",
 		LangSpanish:            "Plan",
+	},
+	MsgUsagePrimary: {
+		LangEnglish:            "Primary quota",
+		LangChinese:            "主额度",
+		LangTraditionalChinese: "主額度",
+		LangJapanese:           "主制限",
+		LangSpanish:            "Cuota principal",
+	},
+	MsgUsageSecondary: {
+		LangEnglish:            "Secondary quota",
+		LangChinese:            "次额度",
+		LangTraditionalChinese: "次額度",
+		LangJapanese:           "副制限",
+		LangSpanish:            "Cuota secundaria",
 	},
 	MsgUsageDaily: {
 		LangEnglish:            "Daily Quota",
