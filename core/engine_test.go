@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1769,6 +1770,197 @@ func TestDrainEventsOpenChannel(t *testing.T) {
 	case <-ch:
 		t.Fatal("expected channel to be drained")
 	default:
+	}
+}
+
+// --- Message queuing tests ---
+
+type queueTestAgent struct {
+	nextSession AgentSession
+}
+
+func (a *queueTestAgent) Name() string { return "queue-test" }
+func (a *queueTestAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
+	return a.nextSession, nil
+}
+func (a *queueTestAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) { return nil, nil }
+func (a *queueTestAgent) Stop() error                                                { return nil }
+
+// queuingAgentSession records Send calls and emits events via a controllable channel.
+type queuingAgentSession struct {
+	sessionID string
+	events    chan Event
+	alive     bool
+	closed    chan struct{}
+	sendCalls []string
+	sendMu    sync.Mutex
+}
+
+func newQueuingSession(id string) *queuingAgentSession {
+	return &queuingAgentSession{
+		sessionID: id,
+		events:    make(chan Event, 16),
+		alive:     true,
+		closed:    make(chan struct{}),
+	}
+}
+
+func (s *queuingAgentSession) Send(prompt string, _ []ImageAttachment) error {
+	s.sendMu.Lock()
+	s.sendCalls = append(s.sendCalls, prompt)
+	s.sendMu.Unlock()
+	return nil
+}
+
+func (s *queuingAgentSession) RespondPermission(_ string, _ PermissionResult) error { return nil }
+func (s *queuingAgentSession) Events() <-chan Event                                 { return s.events }
+func (s *queuingAgentSession) CurrentSessionID() string                             { return s.sessionID }
+func (s *queuingAgentSession) Alive() bool                                          { return s.alive }
+func (s *queuingAgentSession) Close() error {
+	if s.alive {
+		s.alive = false
+		close(s.closed)
+	}
+	return nil
+}
+
+func TestQueueMessageForBusySession_FIFODequeue(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("qs1")
+	agent := &queueTestAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+
+	// Set up an interactive state as if a turn is in progress.
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx1",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	// Queue two messages while the session is "busy".
+	msg1 := &Message{SessionKey: key, Content: "msg1", ReplyCtx: "ctx-msg1"}
+	msg2 := &Message{SessionKey: key, Content: "msg2", ReplyCtx: "ctx-msg2"}
+
+	ok1 := e.queueMessageForBusySession(p, msg1, key)
+	ok2 := e.queueMessageForBusySession(p, msg2, key)
+
+	if !ok1 || !ok2 {
+		t.Fatal("expected both messages to be queued successfully")
+	}
+
+	// Since deferred-send, messages are NOT sent to agent stdin at queue
+	// time — only metadata is stored. Verify no Send calls occurred.
+	sess.sendMu.Lock()
+	if len(sess.sendCalls) != 0 {
+		t.Fatalf("sendCalls = %v, want [] (deferred send)", sess.sendCalls)
+	}
+	sess.sendMu.Unlock()
+
+	// Verify pending messages queue has correct FIFO order.
+	state.mu.Lock()
+	if len(state.pendingMessages) != 2 {
+		t.Fatalf("pendingMessages len = %d, want 2", len(state.pendingMessages))
+	}
+	if state.pendingMessages[0].content != "msg1" || state.pendingMessages[1].content != "msg2" {
+		t.Fatalf("pendingMessages = [%s, %s], want [msg1, msg2]",
+			state.pendingMessages[0].content, state.pendingMessages[1].content)
+	}
+	state.mu.Unlock()
+}
+
+func TestProcessInteractiveEvents_DrainsQueuedMessages(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("qs2")
+	agent := &queueTestAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	session := e.sessions.GetOrCreateActive(key)
+
+	// Pre-populate the interactive state with one queued message.
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx-turn1",
+		pendingMessages: []queuedMessage{
+			{platform: p, replyCtx: "ctx-turn2", content: "queued-msg"},
+		},
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	// Simulate the agent completing turn 1 then turn 2.
+	// Turn 2 events are pushed only after Send() is called for the queued
+	// message, matching real-world timing where the agent doesn't produce
+	// events for a turn until it receives the prompt on stdin.
+	go func() {
+		// Turn 1 result
+		sess.events <- Event{Type: EventText, Content: "response1"}
+		sess.events <- Event{Type: EventResult, Content: "response1", Done: true}
+		// Wait for the queued message's Send() call before pushing turn 2 events.
+		sess.sendMu.Lock()
+		for len(sess.sendCalls) == 0 {
+			sess.sendMu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+			sess.sendMu.Lock()
+		}
+		sess.sendMu.Unlock()
+		// Turn 2 result (for the queued message)
+		sess.events <- Event{Type: EventText, Content: "response2"}
+		sess.events <- Event{Type: EventResult, Content: "response2", Done: true}
+	}()
+
+	session.AddHistory("user", "initial-msg")
+
+	// processInteractiveEvents should handle both turns.
+	done := make(chan struct{})
+	go func() {
+		e.processInteractiveEvents(state, session, e.sessions, key, "msg1", time.Now(), nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// ok
+	case <-time.After(5 * time.Second):
+		t.Fatal("processInteractiveEvents did not complete in time")
+	}
+
+	// Verify queue is empty after processing.
+	state.mu.Lock()
+	remaining := len(state.pendingMessages)
+	state.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("pendingMessages after processing = %d, want 0", remaining)
+	}
+
+	// Verify both turns recorded in session history.
+	history := session.GetHistory(100)
+	var assistantMsgs []string
+	for _, h := range history {
+		if h.Role == "assistant" {
+			assistantMsgs = append(assistantMsgs, h.Content)
+		}
+	}
+	if len(assistantMsgs) != 2 {
+		t.Fatalf("assistant history entries = %d, want 2", len(assistantMsgs))
+	}
+
+	// Verify the queued message was also added to history.
+	var userMsgs []string
+	for _, h := range history {
+		if h.Role == "user" {
+			userMsgs = append(userMsgs, h.Content)
+		}
+	}
+	if len(userMsgs) < 2 {
+		t.Fatalf("user history entries = %d, want >= 2", len(userMsgs))
 	}
 }
 

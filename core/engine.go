@@ -20,6 +20,7 @@ import (
 )
 
 const maxPlatformMessageLen = 4000
+const maxQueuedMessages = 5 // cap queued messages to bound memory usage
 
 const (
 	defaultThinkingMaxLen = 300
@@ -196,18 +197,35 @@ type workspaceInitFlow struct {
 	channelName string
 }
 
+// queuedMessage holds a message that arrived while the session was busy.
+// The message is NOT sent to agent stdin at queue time; the event loop
+// sends it after the current turn completes to avoid mid-turn interference.
+type queuedMessage struct {
+	platform      Platform
+	replyCtx      any
+	content       string
+	images        []ImageAttachment
+	files         []FileAttachment
+	fromVoice     bool
+	userID        string
+	msgPlatform   string // platform name for sender injection
+	msgSessionKey string // session key for extracting chat ID
+}
+
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
-	agentSession AgentSession
-	platform     Platform
-	replyCtx     any
-	workspaceDir string
-	mu           sync.Mutex
-	pending      *pendingPermission
-	approveAll   bool // when true, auto-approve all permission requests for this session
-	quiet        bool // when true, suppress thinking and tool progress for this session
-	fromVoice    bool // true if current turn originated from voice transcription
-	deleteMode   *deleteModeState
+	agentSession    AgentSession
+	platform        Platform
+	replyCtx        any
+	workspaceDir    string
+	mu              sync.Mutex
+	pending         *pendingPermission
+	pendingMessages []queuedMessage // messages queued while session was busy
+	approveAll      bool            // when true, auto-approve all permission requests for this session
+	quiet           bool            // when true, suppress thinking and tool progress for this session
+	fromVoice       bool            // true if current turn originated from voice transcription
+	sideText        string
+	deleteMode      *deleteModeState
 }
 
 type deleteModeState struct {
@@ -773,6 +791,18 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 
 	session := sessions.GetOrCreateActive(msg.SessionKey)
 	if !session.TryLock() {
+		// Session is busy — try to queue the message for the running turn
+		// so the agent processes it immediately after the current turn ends.
+		if e.queueMessageForBusySession(p, msg, interactiveKey) {
+			// Race guard: the drain loop in processInteractiveMessageWith may
+			// have just finished (session unlocked) between our TryLock failure
+			// and the queue append. Re-try TryLock — if it succeeds, no one is
+			// draining the queue so we must start a processor ourselves.
+			if session.TryLock() {
+				go e.drainOrphanedQueue(session, interactiveKey, agent, sessions, resolvedWorkspace)
+			}
+			return
+		}
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 		return
 	}
@@ -784,6 +814,122 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	)
 
 	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace)
+}
+
+// queueMessageForBusySession queues a message for later delivery when the
+// session is busy. The message is NOT sent to agent stdin at queue time;
+// the event loop sends it after the current turn's EventResult is received.
+// Returns true if the message was successfully queued, false otherwise.
+func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiveKey string) bool {
+	e.interactiveMu.Lock()
+	state, hasState := e.interactiveStates[interactiveKey]
+	e.interactiveMu.Unlock()
+
+	if !hasState || state == nil || state.agentSession == nil || !state.agentSession.Alive() {
+		return false
+	}
+
+	// Only queue metadata — do NOT send to agent stdin yet.
+	// The agent CLI may treat a mid-turn stdin message as part of the
+	// current turn, causing the event loop to hang waiting for a second
+	// EventResult that never arrives. Instead, the event loop sends the
+	// message after the current turn's EventResult is received.
+	state.mu.Lock()
+	if len(state.pendingMessages) >= maxQueuedMessages {
+		state.mu.Unlock()
+		return false // fall back to "previous processing" reply
+	}
+	state.pendingMessages = append(state.pendingMessages, queuedMessage{
+		platform:      p,
+		replyCtx:      msg.ReplyCtx,
+		content:       msg.Content,
+		images:        msg.Images,
+		files:         msg.Files,
+		fromVoice:     msg.FromVoice,
+		userID:        msg.UserID,
+		msgPlatform:   msg.Platform,
+		msgSessionKey: msg.SessionKey,
+	})
+	queueDepth := len(state.pendingMessages)
+	state.mu.Unlock()
+
+	slog.Info("message queued for busy session",
+		"session", msg.SessionKey,
+		"user", msg.UserName,
+		"queue_depth", queueDepth,
+	)
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+	return true
+}
+
+// drainOrphanedQueue is called when a message was queued but the drain loop
+// has already exited. It processes all pending messages in the state, similar
+// to the drain loop in processInteractiveMessageWith but as a standalone
+// goroutine.
+func (e *Engine) drainOrphanedQueue(session *Session, interactiveKey string, agent Agent, sessions *SessionManager, workspaceDir string) {
+	unlocked := false
+	defer func() {
+		if !unlocked {
+			session.Unlock()
+		}
+	}()
+
+	e.interactiveMu.Lock()
+	state, hasState := e.interactiveStates[interactiveKey]
+	e.interactiveMu.Unlock()
+
+	if !hasState || state == nil || state.agentSession == nil || !state.agentSession.Alive() {
+		// State disappeared — notify any queued senders that their messages are lost.
+		if hasState && state != nil {
+			e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent session ended"))
+		}
+		return
+	}
+
+	for {
+		state.mu.Lock()
+		if len(state.pendingMessages) == 0 {
+			session.Unlock()
+			unlocked = true
+			state.mu.Unlock()
+			return
+		}
+		queued := state.pendingMessages[0]
+		state.pendingMessages = state.pendingMessages[1:]
+		state.platform = queued.platform
+		state.replyCtx = queued.replyCtx
+		state.fromVoice = queued.fromVoice
+		state.mu.Unlock()
+
+		e.i18n.DetectAndSet(queued.content)
+
+		queuedPrompt := queued.content
+		queuedPrompt = e.preparePromptWithFiles(agent, workspaceDir, queuedPrompt, queued.files)
+
+		if state.agentSession == nil || !state.agentSession.Alive() {
+			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session ended"))
+			e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent session ended"))
+			return
+		}
+
+		drainEvents(state.agentSession.Events())
+
+		if err := state.agentSession.Send(queuedPrompt, queued.images); err != nil {
+			slog.Error("failed to send orphaned queued message", "error", err, "session", interactiveKey)
+			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+			e.notifyDroppedQueuedMessages(state, err)
+			return
+		}
+		session.AddHistory("user", queued.content)
+
+		var stopTyping func()
+		if ti, ok := queued.platform.(TypingIndicator); ok {
+			stopTyping = ti.StartTyping(e.ctx, queued.replyCtx)
+		}
+
+		slog.Info("processing orphaned queued message", "session", interactiveKey)
+		e.processInteractiveEvents(state, session, sessions, interactiveKey, "", time.Now(), stopTyping)
+	}
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -940,7 +1086,16 @@ func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Se
 // It accepts an explicit agent, interactiveKey (for the interactiveStates map),
 // and workspaceDir so that multi-workspace mode can route to per-workspace agents.
 func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string) {
-	defer session.Unlock()
+	// session.Unlock() is NOT deferred here — it is called explicitly in
+	// the drain loop below while holding state.mu to close the race window
+	// between "queue is empty" and "session unlocked". A deferred fallback
+	// ensures the lock is released on early-return paths.
+	unlocked := false
+	defer func() {
+		if !unlocked {
+			session.Unlock()
+		}
+	}()
 
 	if e.ctx.Err() != nil {
 		return
@@ -980,12 +1135,16 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		return
 	}
 
-	// Start typing indicator if platform supports it
+	// Start typing indicator if platform supports it.
+	// Ownership is transferred to processInteractiveEvents which manages
+	// stopping/restarting it across queued message turns.
 	var stopTyping func()
 	if ti, ok := p.(TypingIndicator); ok {
 		stopTyping = ti.StartTyping(e.ctx, msg.ReplyCtx)
 	}
 	defer func() {
+		// Stop typing if ownership was NOT transferred to processInteractiveEvents
+		// (i.e. an early return before that call).
 		if stopTyping != nil {
 			stopTyping()
 		}
@@ -1000,18 +1159,31 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	state.mu.Lock()
 	state.fromVoice = msg.FromVoice
 	state.mu.Unlock()
-	prompt := e.preparePromptWithFiles(e.agent, "", msg.Content, msg.Files)
+	prompt := e.preparePromptWithFiles(agent, workspaceDir, msg.Content, msg.Files)
 	if err := state.agentSession.Send(prompt, msg.Images); err != nil {
 		slog.Error("failed to send prompt", "error", err)
 
 		if !state.agentSession.Alive() {
-			e.cleanupInteractiveState(interactiveKey)
+			// Preserve queued messages before cleanup so we can migrate
+			// them to the replacement state after restart.
+			state.mu.Lock()
+			savedQueue := state.pendingMessages
+			state.pendingMessages = nil
+			state.mu.Unlock()
+
+			e.cleanupInteractiveState(interactiveKey, state)
 			e.send(p, msg.ReplyCtx, e.i18n.T(MsgSessionRestarting))
 
 			state = e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride)
 			if workspaceDir != "" {
 				state.mu.Lock()
 				state.workspaceDir = workspaceDir
+				state.mu.Unlock()
+			}
+			// Restore queued messages on the new state.
+			if len(savedQueue) > 0 {
+				state.mu.Lock()
+				state.pendingMessages = append(state.pendingMessages, savedQueue...)
 				state.mu.Unlock()
 			}
 			if state.agentSession == nil {
@@ -1032,7 +1204,61 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
 
-	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart)
+	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping)
+	stopTyping = nil // ownership transferred; prevent defer from double-stopping
+
+	// Guard against a narrow race: a message may have been queued between
+	// processInteractiveEvents observing an empty queue and returning here
+	// (session is still locked, so handleMessage's TryLock fails and routes
+	// the message to queueMessageForBusySession). Drain any such orphans.
+	//
+	// When the queue is empty we unlock the session while still holding
+	// state.mu so that any message arriving after this point will find
+	// TryLock() succeeds and goes through the normal handleMessage path.
+	for {
+		state.mu.Lock()
+		if len(state.pendingMessages) == 0 {
+			session.Unlock()
+			unlocked = true
+			state.mu.Unlock()
+			return
+		}
+		queued := state.pendingMessages[0]
+		state.pendingMessages = state.pendingMessages[1:]
+		state.platform = queued.platform
+		state.replyCtx = queued.replyCtx
+		state.fromVoice = queued.fromVoice
+		state.mu.Unlock()
+
+		e.i18n.DetectAndSet(queued.content)
+
+		queuedPrompt := queued.content
+		queuedPrompt = e.preparePromptWithFiles(agent, workspaceDir, queuedPrompt, queued.files)
+
+		// Abort if the agent process has exited — notify remaining queued senders.
+		if state.agentSession == nil || !state.agentSession.Alive() {
+			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session ended"))
+			e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent session ended"))
+			return
+		}
+
+		// Drain stale events before starting a new turn (same as processInteractiveMessageWith).
+		drainEvents(state.agentSession.Events())
+
+		if err := state.agentSession.Send(queuedPrompt, queued.images); err != nil {
+			slog.Error("failed to send orphaned queued message", "error", err, "session", interactiveKey)
+			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+			e.notifyDroppedQueuedMessages(state, err)
+			return
+		}
+		session.AddHistory("user", queued.content)
+
+		var newStopTyping func()
+		if ti, ok := queued.platform.(TypingIndicator); ok {
+			newStopTyping = ti.StartTyping(e.ctx, queued.replyCtx)
+		}
+		e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, time.Now(), newStopTyping)
+	}
 }
 
 // getOrCreateWorkspaceAgent returns (or creates) a per-workspace agent and session manager.
@@ -1233,11 +1459,20 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	return state
 }
 
-func (e *Engine) cleanupInteractiveState(sessionKey string) {
+func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interactiveState) {
 	e.interactiveMu.Lock()
 	state, ok := e.interactiveStates[sessionKey]
+	if len(expected) > 0 && expected[0] != nil && state != expected[0] {
+		e.interactiveMu.Unlock()
+		return
+	}
 	delete(e.interactiveStates, sessionKey)
 	e.interactiveMu.Unlock()
+
+	// Notify senders of any queued messages that will never be processed.
+	if ok && state != nil {
+		e.notifyDroppedQueuedMessages(state, fmt.Errorf("session reset"))
+	}
 
 	if ok && state != nil && state.agentSession != nil {
 		slog.Debug("cleanupInteractiveState: closing agent session", "session", sessionKey)
@@ -1262,11 +1497,20 @@ func (e *Engine) cleanupInteractiveState(sessionKey string) {
 
 const defaultEventIdleTimeout = 2 * time.Hour
 
-func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time) {
+func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func()) {
 	var textParts []string
 	toolCount := 0
 	waitStart := time.Now()
 	firstEventLogged := false
+
+	// stopTyping tracks the current turn's typing indicator so it can be
+	// stopped when a queued message starts a new turn.
+	stopTyping := stopTypingFn
+	defer func() {
+		if stopTyping != nil {
+			stopTyping()
+		}
+	}()
 
 	state.mu.Lock()
 	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx)
@@ -1495,6 +1739,96 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			}
 
+			// Check for queued messages — if present, continue the event loop
+			// for the next turn instead of returning.
+			state.mu.Lock()
+			if len(state.pendingMessages) > 0 {
+				queued := state.pendingMessages[0]
+				state.pendingMessages = state.pendingMessages[1:]
+				remainingQueue := len(state.pendingMessages)
+				state.platform = queued.platform
+				state.replyCtx = queued.replyCtx
+				state.fromVoice = queued.fromVoice
+				workspaceDir := state.workspaceDir
+				state.mu.Unlock()
+
+				// Stop the previous turn's typing indicator
+				if stopTyping != nil {
+					stopTyping()
+					stopTyping = nil
+				}
+				// Start a new typing indicator for the queued message's context
+				if ti, ok := queued.platform.(TypingIndicator); ok {
+					stopTyping = ti.StartTyping(e.ctx, queued.replyCtx)
+				}
+
+				// Drain stale events before starting the next turn. Between
+				// EventResult and Send(), the only buffered events would be
+				// stale leftovers (e.g. a deferred EventError from cmd.Wait()).
+				drainEvents(state.agentSession.Events())
+
+				// Build prompt content for the queued message
+				queuedPrompt := queued.content
+				agent, _ := e.sessionContextForKey(session.ID)
+				queuedPrompt = e.preparePromptWithFiles(agent, workspaceDir, queuedPrompt, queued.files)
+
+				// NOW send the queued message to agent stdin (not at queue time).
+				if err := state.agentSession.Send(queuedPrompt, queued.images); err != nil {
+					slog.Error("failed to send queued message to agent", "error", err, "session", sessionKey)
+
+					// Send failed — stop typing, notify user, drain remaining queue.
+					// We intentionally do NOT attempt to restart the session here:
+					// the restart path introduces complex state management issues
+					// (stale session pointers, FIFO ordering, workspace agent
+					// recreation races). The user's next message will trigger a
+					// normal session restart via processInteractiveMessageWith.
+					if stopTyping != nil {
+						stopTyping()
+						stopTyping = nil
+					}
+					e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+					state.mu.Lock()
+					remaining := state.pendingMessages
+					state.pendingMessages = nil
+					state.mu.Unlock()
+					for _, q := range remaining {
+						e.send(q.platform, q.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+					}
+					return
+				}
+
+				// Detect language now (deferred from queue time to avoid
+				// flipping locale while the previous turn is still running).
+				e.i18n.DetectAndSet(queued.content)
+
+				// Reset per-turn state for the next turn
+				textParts = nil
+				toolCount = 0
+				turnStart = time.Now()
+				firstEventLogged = false
+				waitStart = time.Now()
+				sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx)
+
+				session.AddHistory("user", queued.content)
+
+				if idleTimer != nil {
+					if !idleTimer.Stop() {
+						select {
+						case <-idleTimer.C:
+						default:
+						}
+					}
+					idleTimer.Reset(e.eventIdleTimeout)
+				}
+
+				slog.Info("processing queued message",
+					"session", sessionKey,
+					"remaining_queue", remainingQueue,
+				)
+				continue
+			}
+			state.mu.Unlock()
+
 			return
 
 		case EventError:
@@ -1503,6 +1837,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				slog.Error("agent error", "error", event.Error)
 				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
 			}
+			// Only drop queued messages if the agent session is dead.
+			// Some agents (e.g. Codex) emit EventError for per-turn failures
+			// while keeping the session alive for subsequent turns.
+			if state.agentSession == nil || !state.agentSession.Alive() {
+				e.notifyDroppedQueuedMessages(state, event.Error)
+			}
 			return
 		}
 	}
@@ -1510,7 +1850,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 channelClosed:
 	// Channel closed - process exited unexpectedly
 	slog.Warn("agent process exited", "session_key", sessionKey)
-	e.cleanupInteractiveState(sessionKey)
+	e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent process exited"))
+	e.cleanupInteractiveState(sessionKey, state)
 
 	if len(textParts) > 0 {
 		state.mu.Lock()
@@ -1534,6 +1875,20 @@ channelClosed:
 				}
 			}
 		}
+	}
+}
+
+// notifyDroppedQueuedMessages drains pendingMessages from the state and
+// sends an error notification to each queued message's sender. Called when
+// the event loop exits abnormally (EventError, channel closed) and queued
+// messages can no longer be delivered to the agent.
+func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason error) {
+	state.mu.Lock()
+	remaining := state.pendingMessages
+	state.pendingMessages = nil
+	state.mu.Unlock()
+	for _, q := range remaining {
+		e.send(q.platform, q.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), reason))
 	}
 }
 
@@ -3883,7 +4238,15 @@ func (e *Engine) cmdCompress(p Platform, msg *Message) {
 	e.send(p, msg.ReplyCtx, e.i18n.T(MsgCompressing))
 
 	go func() {
-		defer session.Unlock()
+		// session.Unlock() is called inside drainQueuedMessagesAfterCompress
+		// while holding state.mu to close the race window. Deferred fallback
+		// ensures the lock is released on early-return paths.
+		compressUnlocked := false
+		defer func() {
+			if !compressUnlocked {
+				session.Unlock()
+			}
+		}()
 
 		state.mu.Lock()
 		state.platform = p
@@ -3901,14 +4264,15 @@ func (e *Engine) cmdCompress(p Platform, msg *Message) {
 			return
 		}
 
-		e.processCompressEvents(state, iKey, p, msg.ReplyCtx)
+		e.processCompressEvents(state, session, sessions, iKey, p, msg.ReplyCtx, &compressUnlocked)
 	}()
 }
 
 // processCompressEvents drains agent events after a compress command.
 // Unlike processInteractiveEvents it does NOT record history and treats
 // an empty result as success rather than "(empty response)".
-func (e *Engine) processCompressEvents(state *interactiveState, sessionKey string, p Platform, replyCtx any) {
+func (e *Engine) processCompressEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, p Platform, replyCtx any, unlocked *bool) {
+
 	var textParts []string
 	events := state.agentSession.Events()
 
@@ -3933,11 +4297,13 @@ func (e *Engine) processCompressEvents(state *interactiveState, sessionKey strin
 				} else {
 					e.reply(p, replyCtx, e.i18n.T(MsgCompressDone))
 				}
+				e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent process exited during compress"))
 				return
 			}
 		case <-idleCh:
 			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "compress timed out"))
-			e.cleanupInteractiveState(sessionKey)
+			e.cleanupInteractiveState(sessionKey, state)
+			e.notifyDroppedQueuedMessages(state, fmt.Errorf("compress timed out"))
 			return
 		case <-e.ctx.Done():
 			return
@@ -3968,10 +4334,21 @@ func (e *Engine) processCompressEvents(state *interactiveState, sessionKey strin
 			} else {
 				e.reply(p, replyCtx, e.i18n.T(MsgCompressDone))
 			}
+
+			// After compress succeeds, process any queued messages instead of dropping them.
+			e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked)
 			return
 		case EventError:
 			if event.Error != nil {
 				e.reply(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
+			}
+			// Only drop queued messages if the agent is dead; some agents
+			// emit per-turn EventError while staying alive.
+			if !state.agentSession.Alive() {
+				e.notifyDroppedQueuedMessages(state, event.Error)
+			} else {
+				// Agent survived — try to process queued messages.
+				e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked)
 			}
 			return
 		case EventPermissionRequest:
@@ -3980,6 +4357,54 @@ func (e *Engine) processCompressEvents(state *interactiveState, sessionKey strin
 				UpdatedInput: event.ToolInputRaw,
 			})
 		}
+	}
+}
+
+// drainQueuedMessagesAfterCompress processes any messages that were queued
+// during a /compress operation. It sends each one to the agent and runs the
+// full interactive event loop for it.
+func (e *Engine) drainQueuedMessagesAfterCompress(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, unlocked *bool) {
+	for {
+		state.mu.Lock()
+		if len(state.pendingMessages) == 0 {
+			// Unlock session while holding state.mu to close the race window.
+			session.Unlock()
+			*unlocked = true
+			state.mu.Unlock()
+			return
+		}
+		queued := state.pendingMessages[0]
+		state.pendingMessages = state.pendingMessages[1:]
+		state.platform = queued.platform
+		state.replyCtx = queued.replyCtx
+		state.fromVoice = queued.fromVoice
+		workspaceDir := state.workspaceDir
+		state.mu.Unlock()
+
+		// Drain stale events from the previous turn (compress or prior queued
+		// turn) to avoid feeding leftover EventError/exit events into this turn.
+		drainEvents(state.agentSession.Events())
+
+		// Build prompt
+		queuedPrompt := queued.content
+		agent, _ := e.sessionContextForKey(session.ID)
+		queuedPrompt = e.preparePromptWithFiles(agent, workspaceDir, queuedPrompt, queued.files)
+
+		if err := state.agentSession.Send(queuedPrompt, queued.images); err != nil {
+			slog.Error("failed to send queued message after compress", "error", err, "session", sessionKey)
+			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+			e.notifyDroppedQueuedMessages(state, err)
+			return
+		}
+
+		session.AddHistory("user", queued.content)
+
+		slog.Info("processing queued message after compress",
+			"session", sessionKey,
+		)
+
+		// Run the full event loop for this queued turn.
+		e.processInteractiveEvents(state, session, sessions, sessionKey, "", time.Now(), nil)
 	}
 }
 
