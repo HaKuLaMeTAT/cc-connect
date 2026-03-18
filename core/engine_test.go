@@ -1644,7 +1644,7 @@ func TestSessionMismatch_RecyclesStaleAgent(t *testing.T) {
 	e.interactiveMu.Unlock()
 
 	session := &Session{AgentSessionID: "new-agent-id"}
-	state := e.getOrCreateInteractiveState(key, p, "ctx", session)
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil)
 
 	if state.agentSession == oldSess {
 		t.Fatal("expected stale agent session to be replaced")
@@ -1677,7 +1677,7 @@ func TestSessionClearedAfterNew_RecyclesAliveAgent(t *testing.T) {
 	e.interactiveMu.Unlock()
 
 	session := &Session{}
-	state := e.getOrCreateInteractiveState(key, p, "ctx", session)
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil)
 
 	if state.agentSession == oldSess {
 		t.Fatal("expected stale agent to be recycled when AgentSessionID was cleared")
@@ -1690,5 +1690,148 @@ func TestSessionClearedAfterNew_RecyclesAliveAgent(t *testing.T) {
 	case <-oldSess.closed:
 	case <-time.After(2 * time.Second):
 		t.Fatal("old agent session was not closed after /new-style clear")
+	}
+}
+
+func TestSessionMismatch_ReusesWhenIDsMatch(t *testing.T) {
+	agent := &controllableAgent{}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	existingSess := newControllableSession("matching-id")
+	existingState := &interactiveState{
+		agentSession: existingSess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = existingState
+	e.interactiveMu.Unlock()
+
+	session := &Session{AgentSessionID: "matching-id"}
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil)
+	if state != existingState {
+		t.Fatal("expected existing state to be reused when session IDs match")
+	}
+}
+
+func TestSessionIDWriteback_ImmediateAfterStartSession(t *testing.T) {
+	sess := newControllableSession("agent-uuid-123")
+	agent := &controllableAgent{nextSession: sess}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	session := &Session{AgentSessionID: ""}
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil)
+
+	if got := session.GetAgentSessionID(); got != "agent-uuid-123" {
+		t.Fatalf("AgentSessionID = %q, want %q", got, "agent-uuid-123")
+	}
+}
+
+func TestSessionIDWriteback_DoesNotOverwriteExisting(t *testing.T) {
+	sess := newControllableSession("new-uuid")
+	agent := &controllableAgent{nextSession: sess}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	session := &Session{AgentSessionID: "existing-uuid"}
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil)
+
+	if got := session.GetAgentSessionID(); got != "existing-uuid" {
+		t.Fatalf("AgentSessionID = %q, want %q", got, "existing-uuid")
+	}
+}
+
+func TestDrainEventsOpenChannel(t *testing.T) {
+	ch := make(chan Event, 3)
+	ch <- Event{Type: EventToolUse, Content: "a"}
+	ch <- Event{Type: EventToolUse, Content: "b"}
+
+	done := make(chan struct{})
+	go func() {
+		drainEvents(ch)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// ok
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainEvents did not return on open channel with buffered events")
+	}
+
+	// Channel should now be empty.
+	select {
+	case <-ch:
+		t.Fatal("expected channel to be drained")
+	default:
+	}
+}
+
+// ── executeCardAction interactiveKey tests ───────────────────
+
+func TestExecuteCardAction_QuietUsesInteractiveKey(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	sessionKey := "feishu:channel1:user1"
+
+	e.executeCardAction("/quiet", "", sessionKey)
+
+	e.interactiveMu.Lock()
+	_, ok := e.interactiveStates[sessionKey]
+	e.interactiveMu.Unlock()
+	if !ok {
+		t.Error("expected interactive state to be stored under sessionKey (non-multi-workspace)")
+	}
+}
+
+func TestExecuteCardAction_ModelCleansUpWithInteractiveKey(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubModelModeAgent{model: "old"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	sessionKey := "feishu:channel1:user1"
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[sessionKey] = &interactiveState{}
+	e.interactiveMu.Unlock()
+
+	e.executeCardAction("/model", "new-model", sessionKey)
+
+	if agent.model != "new-model" {
+		t.Errorf("model = %q, want new-model", agent.model)
+	}
+
+	e.interactiveMu.Lock()
+	_, exists := e.interactiveStates[sessionKey]
+	e.interactiveMu.Unlock()
+	if exists {
+		t.Error("expected interactive state to be cleaned up after /model")
+	}
+}
+
+func TestExecuteCardAction_ModeCleansUpWithInteractiveKey(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubModelModeAgent{mode: "default"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	sessionKey := "feishu:channel1:user1"
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[sessionKey] = &interactiveState{}
+	e.interactiveMu.Unlock()
+
+	e.executeCardAction("/mode", "yolo", sessionKey)
+
+	e.interactiveMu.Lock()
+	_, exists := e.interactiveStates[sessionKey]
+	e.interactiveMu.Unlock()
+	if exists {
+		t.Error("expected interactive state to be cleaned up after /mode")
 	}
 }

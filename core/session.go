@@ -183,7 +183,9 @@ func (sm *SessionManager) GetOrCreateActive(userKey string) *Session {
 			return s
 		}
 	}
-	return sm.createLocked(userKey, "default")
+	s := sm.createLocked(userKey, "default")
+	sm.saveLocked()
+	return s
 }
 
 // SessionByID returns a session by internal ID, or nil if missing.
