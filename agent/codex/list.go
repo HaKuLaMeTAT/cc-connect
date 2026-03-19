@@ -345,10 +345,14 @@ func applyCodexRateLimits(usage *core.ContextUsage, limits *codexRateLimits) {
 
 	windows := make([]core.UsageQuota, 0, 2)
 	if limits.Primary != nil {
-		windows = append(windows, quotaFromCodexWindow("primary", limits.Primary))
+		if quota, ok := quotaFromCodexWindow("primary", limits.Primary, time.Now()); ok {
+			windows = append(windows, quota)
+		}
 	}
 	if limits.Secondary != nil {
-		windows = append(windows, quotaFromCodexWindow("secondary", limits.Secondary))
+		if quota, ok := quotaFromCodexWindow("secondary", limits.Secondary, time.Now()); ok {
+			windows = append(windows, quota)
+		}
 	}
 	if len(windows) == 0 {
 		return
@@ -374,7 +378,7 @@ func applyCodexRateLimits(usage *core.ContextUsage, limits *codexRateLimits) {
 	}
 }
 
-func quotaFromCodexWindow(label string, window *codexRateLimitWindow) core.UsageQuota {
+func quotaFromCodexWindow(label string, window *codexRateLimitWindow, now time.Time) (core.UsageQuota, bool) {
 	quota := core.UsageQuota{
 		Label:         label,
 		WindowMinutes: window.WindowMinutes,
@@ -382,8 +386,11 @@ func quotaFromCodexWindow(label string, window *codexRateLimitWindow) core.Usage
 	}
 	if window.ResetsAt > 0 {
 		quota.ResetsAt = time.Unix(window.ResetsAt, 0)
+		if !now.IsZero() && quota.ResetsAt.Before(now) {
+			return core.UsageQuota{}, false
+		}
 	}
-	return quota
+	return quota, true
 }
 
 func codexQuotaDisplayPercent(usedPercent float64) float64 {

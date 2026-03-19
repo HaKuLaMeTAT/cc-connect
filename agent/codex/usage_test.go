@@ -4,7 +4,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 )
 
 func TestGetCodexContextUsage_UsesLastTokenUsage(t *testing.T) {
@@ -58,10 +60,12 @@ func TestGetCodexContextUsage_ParsesQuotaWindows(t *testing.T) {
 		t.Fatalf("MkdirAll: %v", err)
 	}
 
+	primaryReset := strconv.FormatInt(time.Now().Add(2*time.Hour).Unix(), 10)
+	secondaryReset := strconv.FormatInt(time.Now().Add(7*24*time.Hour).Unix(), 10)
 	path := filepath.Join(sessionsDir, "rollout-"+sessionID+".jsonl")
 	data := "" +
 		"{\"timestamp\":\"2026-03-11T12:58:46Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"" + sessionID + "\",\"cwd\":\"/tmp\"}}\n" +
-		"{\"timestamp\":\"2026-03-11T12:59:45Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":333,\"output_tokens\":44,\"total_tokens\":377}},\"rate_limits\":{\"primary\":{\"used_percent\":2.0,\"window_minutes\":300,\"resets_at\":1773250997},\"secondary\":{\"used_percent\":3.0,\"window_minutes\":10080,\"resets_at\":1773815495},\"plan_type\":\"plus\"}}}\n"
+		"{\"timestamp\":\"2026-03-11T12:59:45Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":333,\"output_tokens\":44,\"total_tokens\":377}},\"rate_limits\":{\"primary\":{\"used_percent\":2.0,\"window_minutes\":300,\"resets_at\":" + primaryReset + "},\"secondary\":{\"used_percent\":3.0,\"window_minutes\":10080,\"resets_at\":" + secondaryReset + "},\"plan_type\":\"plus\"}}}\n"
 	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -95,17 +99,19 @@ func TestGetCodexContextUsage_UsesLatestGlobalRateLimits(t *testing.T) {
 		t.Fatalf("MkdirAll: %v", err)
 	}
 
+	primaryReset := strconv.FormatInt(time.Now().Add(2*time.Hour).Unix(), 10)
+	secondaryReset := strconv.FormatInt(time.Now().Add(7*24*time.Hour).Unix(), 10)
 	localPath := filepath.Join(sessionsDir, "rollout-"+sessionID+".jsonl")
 	localData := "" +
 		"{\"timestamp\":\"2026-03-11T12:58:46Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"" + sessionID + "\",\"cwd\":\"/tmp\"}}\n" +
-		"{\"timestamp\":\"2026-03-11T12:59:45Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":333,\"output_tokens\":44,\"total_tokens\":377}},\"rate_limits\":{\"primary\":{\"used_percent\":94.0,\"window_minutes\":300,\"resets_at\":1773250997},\"secondary\":{\"used_percent\":98.0,\"window_minutes\":10081,\"resets_at\":1773815495},\"plan_type\":\"plus\"}}}\n"
+		"{\"timestamp\":\"2026-03-11T12:59:45Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":333,\"output_tokens\":44,\"total_tokens\":377}},\"rate_limits\":{\"primary\":{\"used_percent\":94.0,\"window_minutes\":300,\"resets_at\":" + primaryReset + "},\"secondary\":{\"used_percent\":98.0,\"window_minutes\":10081,\"resets_at\":" + secondaryReset + "},\"plan_type\":\"plus\"}}}\n"
 	if err := os.WriteFile(localPath, []byte(localData), 0o644); err != nil {
 		t.Fatalf("WriteFile local: %v", err)
 	}
 
 	globalPath := filepath.Join(sessionsDir, "rollout-global.jsonl")
 	globalData := "" +
-		"{\"timestamp\":\"2026-03-11T14:13:00.899Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}},\"rate_limits\":{\"primary\":{\"used_percent\":18.0,\"window_minutes\":300,\"resets_at\":1773250997},\"secondary\":{\"used_percent\":8.0,\"window_minutes\":10081,\"resets_at\":1773815495},\"plan_type\":\"plus\"}}}\n"
+		"{\"timestamp\":\"2026-03-11T14:13:00.899Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}},\"rate_limits\":{\"primary\":{\"used_percent\":18.0,\"window_minutes\":300,\"resets_at\":" + primaryReset + "},\"secondary\":{\"used_percent\":8.0,\"window_minutes\":10081,\"resets_at\":" + secondaryReset + "},\"plan_type\":\"plus\"}}}\n"
 	if err := os.WriteFile(globalPath, []byte(globalData), 0o644); err != nil {
 		t.Fatalf("WriteFile global: %v", err)
 	}
@@ -133,17 +139,19 @@ func TestGetCodexContextUsage_PrefersNewerSessionRateLimits(t *testing.T) {
 		t.Fatalf("MkdirAll: %v", err)
 	}
 
+	primaryReset := strconv.FormatInt(time.Now().Add(2*time.Hour).Unix(), 10)
+	secondaryReset := strconv.FormatInt(time.Now().Add(7*24*time.Hour).Unix(), 10)
 	localPath := filepath.Join(sessionsDir, "rollout-"+sessionID+".jsonl")
 	localData := "" +
 		"{\"timestamp\":\"2026-03-11T15:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"" + sessionID + "\",\"cwd\":\"/tmp\"}}\n" +
-		"{\"timestamp\":\"2026-03-11T15:10:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":333,\"output_tokens\":44,\"total_tokens\":377}},\"rate_limits\":{\"primary\":{\"used_percent\":12.0,\"window_minutes\":300,\"resets_at\":1773254597},\"secondary\":{\"used_percent\":24.0,\"window_minutes\":10081,\"resets_at\":1773819095},\"plan_type\":\"plus\"}}}\n"
+		"{\"timestamp\":\"2026-03-11T15:10:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":333,\"output_tokens\":44,\"total_tokens\":377}},\"rate_limits\":{\"primary\":{\"used_percent\":12.0,\"window_minutes\":300,\"resets_at\":" + primaryReset + "},\"secondary\":{\"used_percent\":24.0,\"window_minutes\":10081,\"resets_at\":" + secondaryReset + "},\"plan_type\":\"plus\"}}}\n"
 	if err := os.WriteFile(localPath, []byte(localData), 0o644); err != nil {
 		t.Fatalf("WriteFile local: %v", err)
 	}
 
 	globalPath := filepath.Join(sessionsDir, "rollout-global.jsonl")
 	globalData := "" +
-		"{\"timestamp\":\"2026-03-10T23:59:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}},\"rate_limits\":{\"primary\":{\"used_percent\":88.0,\"window_minutes\":300,\"resets_at\":1773200000},\"secondary\":{\"used_percent\":92.0,\"window_minutes\":10081,\"resets_at\":1773760000},\"plan_type\":\"plus\"}}}\n"
+		"{\"timestamp\":\"2026-03-10T23:59:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}},\"rate_limits\":{\"primary\":{\"used_percent\":88.0,\"window_minutes\":300,\"resets_at\":" + primaryReset + "},\"secondary\":{\"used_percent\":92.0,\"window_minutes\":10081,\"resets_at\":" + secondaryReset + "},\"plan_type\":\"plus\"}}}\n"
 	if err := os.WriteFile(globalPath, []byte(globalData), 0o644); err != nil {
 		t.Fatalf("WriteFile global: %v", err)
 	}

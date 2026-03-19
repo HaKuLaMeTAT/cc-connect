@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const maxSavedAttachmentSize = 50 << 20 // 50 MB
+
 // MergeEnv returns base env with entries from extra overriding same-key entries.
 // This prevents duplicate keys (e.g. two PATH entries) which cause the override
 // to be silently ignored on Linux (getenv returns the first match).
@@ -74,10 +76,11 @@ func SaveFilesToDisk(workDir string, files []FileAttachment) []string {
 
 	paths := make([]string, 0, len(files))
 	for i, f := range files {
-		name := strings.TrimSpace(f.FileName)
-		if name == "" {
-			name = fmt.Sprintf("file_%d_%d", time.Now().UnixMilli(), i)
+		if len(f.Data) > maxSavedAttachmentSize {
+			slog.Warn("SaveFilesToDisk: attachment exceeds size limit", "size", len(f.Data), "name", f.FileName)
+			continue
 		}
+		name := sanitizeAttachmentFileName(f.FileName, i)
 		fullPath := filepath.Join(attachDir, name)
 		if err := os.WriteFile(fullPath, f.Data, 0o644); err != nil {
 			slog.Error("SaveFilesToDisk: write failed", "error", err, "path", fullPath)
@@ -86,6 +89,20 @@ func SaveFilesToDisk(workDir string, files []FileAttachment) []string {
 		paths = append(paths, fullPath)
 	}
 	return paths
+}
+
+func sanitizeAttachmentFileName(name string, index int) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Sprintf("file_%d_%d", time.Now().UnixMilli(), index)
+	}
+	name = filepath.Base(filepath.Clean(name))
+	switch name {
+	case "", ".", string(filepath.Separator), "..":
+		return fmt.Sprintf("file_%d_%d", time.Now().UnixMilli(), index)
+	default:
+		return name
+	}
 }
 
 // AppendFileRefs appends locally saved file paths to the prompt so agents can read them.

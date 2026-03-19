@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"github.com/chenhg5/cc-connect/core"
 
@@ -424,7 +425,7 @@ func (p *Platform) handleCallbackQuery(cb *tgbotapi.CallbackQuery) {
 // isDirectedAtBot checks whether a group message is directed at this bot:
 //   - Command with @thisbot suffix (e.g. /help@thisbot)
 //   - Most commands without @suffix are broadcast to all bots
-//   - Cross-bot relay commands (/sendto, /quote, /fwd) require an explicit target
+//   - Cross-bot relay commands (/sendto, /quote, /st, /sd) require an explicit target
 //   - Command with @otherbot suffix → reject
 //   - Non-command: accept if bot is @mentioned or message is a reply to bot
 func (p *Platform) isDirectedAtBot(msg *tgbotapi.Message) bool {
@@ -463,8 +464,8 @@ func (p *Platform) isDirectedAtBot(msg *tgbotapi.Message) bool {
 	// Non-command: check @mention
 	if msg.Entities != nil {
 		for _, e := range msg.Entities {
-			if e.Type == "mention" && e.Offset+e.Length <= len(msg.Text) {
-				mention := msg.Text[e.Offset : e.Offset+e.Length]
+			if e.Type == "mention" {
+				mention := extractEntityText(msg.Text, e.Offset, e.Length)
 				slog.Debug("telegram: checking mention", "bot", botName, "mention", mention, "match", strings.EqualFold(mention, "@"+botName))
 				if strings.EqualFold(mention, "@"+botName) {
 					return true
@@ -484,8 +485,8 @@ func (p *Platform) isDirectedAtBot(msg *tgbotapi.Message) bool {
 	// Also check caption entities (for photos with captions)
 	if msg.CaptionEntities != nil {
 		for _, e := range msg.CaptionEntities {
-			if e.Type == "mention" && e.Offset+e.Length <= len(msg.Caption) {
-				mention := msg.Caption[e.Offset : e.Offset+e.Length]
+			if e.Type == "mention" {
+				mention := extractEntityText(msg.Caption, e.Offset, e.Length)
 				if strings.EqualFold(mention, "@"+botName) {
 					return true
 				}
@@ -783,9 +784,18 @@ func telegramCommandName(text string) string {
 	return strings.ToLower(cmd)
 }
 
+func extractEntityText(text string, offsetUTF16, lengthUTF16 int) string {
+	encoded := utf16.Encode([]rune(text))
+	endUTF16 := offsetUTF16 + lengthUTF16
+	if offsetUTF16 < 0 || endUTF16 > len(encoded) {
+		return ""
+	}
+	return string(utf16.Decode(encoded[offsetUTF16:endUTF16]))
+}
+
 func isTelegramCrossBotCommand(cmd string) bool {
 	switch cmd {
-	case "sendto", "quote", "fwd":
+	case "sendto", "quote", "st", "sd":
 		return true
 	default:
 		return false

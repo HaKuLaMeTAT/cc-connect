@@ -21,6 +21,56 @@ import (
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 )
 
+// sanitizingLogger wraps the SDK logger and masks sensitive URL parameters.
+type sanitizingLogger struct {
+	inner larkcore.Logger
+}
+
+func (l *sanitizingLogger) maskURL(args ...interface{}) []interface{} {
+	masked := make([]interface{}, len(args))
+	for i, arg := range args {
+		if s, ok := arg.(string); ok {
+			masked[i] = l.sanitize(s)
+		} else {
+			masked[i] = arg
+		}
+	}
+	return masked
+}
+
+func (l *sanitizingLogger) sanitize(s string) string {
+	sensitiveParams := []string{
+		"device_id=", "access_key=", "ticket=", "conn_id=",
+		"secret=", "token=", "password=", "key=",
+	}
+	for _, param := range sensitiveParams {
+		if idx := strings.Index(s, param); idx != -1 {
+			end := idx + len(param)
+			for end < len(s) && s[end] != '&' && s[end] != ' ' {
+				end++
+			}
+			s = s[:idx+len(param)] + "***" + s[end:]
+		}
+	}
+	return s
+}
+
+func (l *sanitizingLogger) Debug(ctx context.Context, args ...interface{}) {
+	l.inner.Debug(ctx, l.maskURL(args...)...)
+}
+
+func (l *sanitizingLogger) Info(ctx context.Context, args ...interface{}) {
+	l.inner.Info(ctx, l.maskURL(args...)...)
+}
+
+func (l *sanitizingLogger) Warn(ctx context.Context, args ...interface{}) {
+	l.inner.Warn(ctx, l.maskURL(args...)...)
+}
+
+func (l *sanitizingLogger) Error(ctx context.Context, args ...interface{}) {
+	l.inner.Error(ctx, l.maskURL(args...)...)
+}
+
 func init() {
 	core.RegisterPlatform("feishu", New)
 }
@@ -147,6 +197,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	p.wsClient = larkws.NewClient(p.appID, p.appSecret,
 		larkws.WithEventHandler(eventHandler),
 		larkws.WithLogLevel(larkcore.LogLevelInfo),
+		larkws.WithLogger(&sanitizingLogger{inner: larkcore.NewEventLogger()}),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())

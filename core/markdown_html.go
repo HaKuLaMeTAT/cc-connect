@@ -192,6 +192,8 @@ func SplitMessageCodeFenceAware(text string, maxLen int) []string {
 		return []string{text}
 	}
 
+	const closingFence = "\n```"
+
 	lines := strings.Split(text, "\n")
 	var chunks []string
 	var current []string
@@ -201,10 +203,15 @@ func SplitMessageCodeFenceAware(text string, maxLen int) []string {
 	for _, line := range lines {
 		lineLen := len(line) + 1 // +1 for newline
 
-		if currentLen+lineLen > maxLen && len(current) > 0 {
+		limit := maxLen
+		if openFence != "" {
+			limit -= len(closingFence)
+		}
+
+		if currentLen+lineLen > limit && len(current) > 0 {
 			chunk := strings.Join(current, "\n")
 			if openFence != "" {
-				chunk += "\n```"
+				chunk += closingFence
 			}
 			chunks = append(chunks, chunk)
 

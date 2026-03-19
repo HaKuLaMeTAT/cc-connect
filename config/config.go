@@ -16,20 +16,21 @@ var configMu sync.Mutex
 var ConfigPath string
 
 type Config struct {
-	DataDir     string          `toml:"data_dir"` // session store directory, default ~/.cc-connect
-	Projects    []ProjectConfig `toml:"projects"`
-	Commands    []CommandConfig `toml:"commands"`     // global custom slash commands
-	Aliases     []AliasConfig   `toml:"aliases"`     // global command aliases
-	BannedWords []string        `toml:"banned_words"` // messages containing any of these words are blocked
-	Log         LogConfig       `toml:"log"`
-	Language    string          `toml:"language"` // "en" or "zh", default is "en"
-	Speech      SpeechConfig    `toml:"speech"`
-	TTS         TTSConfig       `toml:"tts"`
-	Display       DisplayConfig       `toml:"display"`
-	StreamPreview StreamPreviewConfig `toml:"stream_preview"` // real-time streaming preview
-	RateLimit     RateLimitConfig     `toml:"rate_limit"`     // per-session rate limiting
-	Quiet            *bool               `toml:"quiet,omitempty"`              // global default for quiet mode; project-level overrides this
-	Cron             CronConfig          `toml:"cron"`
+	DataDir         string              `toml:"data_dir"` // session store directory, default ~/.cc-connect
+	Projects        []ProjectConfig     `toml:"projects"`
+	Commands        []CommandConfig     `toml:"commands"`     // global custom slash commands
+	Aliases         []AliasConfig       `toml:"aliases"`      // global command aliases
+	BannedWords     []string            `toml:"banned_words"` // messages containing any of these words are blocked
+	Log             LogConfig           `toml:"log"`
+	Language        string              `toml:"language"` // "en" or "zh", default is "en"
+	Speech          SpeechConfig        `toml:"speech"`
+	TTS             TTSConfig           `toml:"tts"`
+	Display         DisplayConfig       `toml:"display"`
+	StreamPreview   StreamPreviewConfig `toml:"stream_preview"`  // real-time streaming preview
+	RateLimit       RateLimitConfig     `toml:"rate_limit"`      // per-session rate limiting
+	Relay           RelayConfig         `toml:"relay"`           // bot-to-bot relay behavior
+	Quiet           *bool               `toml:"quiet,omitempty"` // global default for quiet mode; project-level overrides this
+	Cron            CronConfig          `toml:"cron"`
 	IdleTimeoutMins *int                `toml:"idle_timeout_mins,omitempty"` // max minutes between agent events; 0 = no timeout; default 120
 }
 
@@ -40,13 +41,13 @@ type CronConfig struct {
 
 // DisplayConfig controls how intermediate messages (thinking, tool output) are shown.
 type DisplayConfig struct {
-	ThinkingMaxLen  *int `toml:"thinking_max_len"`    // max chars for thinking messages; 0 = no truncation; default 300
-	ToolMaxLen      *int `toml:"tool_max_len"`        // max chars for tool use messages; 0 = no truncation; default 500
+	ThinkingMaxLen *int `toml:"thinking_max_len"` // max chars for thinking messages; 0 = no truncation; default 300
+	ToolMaxLen     *int `toml:"tool_max_len"`     // max chars for tool use messages; 0 = no truncation; default 500
 }
 
 // StreamPreviewConfig controls real-time streaming preview in IM.
 type StreamPreviewConfig struct {
-	Enabled           *bool    `toml:"enabled"`                     // default true
+	Enabled           *bool    `toml:"enabled"`                      // default true
 	DisabledPlatforms []string `toml:"disabled_platforms,omitempty"` // platforms where preview is disabled (e.g. ["feishu"])
 	IntervalMs        *int     `toml:"interval_ms"`                  // min ms between updates; default 1500
 	MinDeltaChars     *int     `toml:"min_delta_chars"`              // min new chars before update; default 30
@@ -57,6 +58,11 @@ type StreamPreviewConfig struct {
 type RateLimitConfig struct {
 	MaxMessages *int `toml:"max_messages"` // max messages per window; 0 = disabled; default 20
 	WindowSecs  *int `toml:"window_secs"`  // window size in seconds; default 60
+}
+
+// RelayConfig controls bot-to-bot relay behavior.
+type RelayConfig struct {
+	TimeoutSecs *int `toml:"timeout_secs"` // max seconds to wait for relay response; 0 = disabled; nil = use per-project defaults
 }
 
 // SpeechConfig configures speech-to-text for voice messages.
@@ -82,12 +88,12 @@ type SpeechConfig struct {
 
 // TTSConfig configures text-to-speech output (mirrors SpeechConfig style).
 type TTSConfig struct {
-	Enabled     bool   `toml:"enabled"`
-	Provider    string `toml:"provider"`     // "qwen" | "openai"
-	Voice       string `toml:"voice"`        // default voice name
-	TTSMode     string `toml:"tts_mode"`     // "voice_only" (default) | "always"
-	MaxTextLen  int    `toml:"max_text_len"` // max rune count before skipping TTS; 0 = no limit
-	OpenAI      struct {
+	Enabled    bool   `toml:"enabled"`
+	Provider   string `toml:"provider"`     // "qwen" | "openai"
+	Voice      string `toml:"voice"`        // default voice name
+	TTSMode    string `toml:"tts_mode"`     // "voice_only" (default) | "always"
+	MaxTextLen int    `toml:"max_text_len"` // max rune count before skipping TTS; 0 = no limit
+	OpenAI     struct {
 		APIKey  string `toml:"api_key"`
 		BaseURL string `toml:"base_url"`
 		Model   string `toml:"model"`
@@ -138,9 +144,9 @@ type AliasConfig struct {
 type CommandConfig struct {
 	Name        string `toml:"name"`
 	Description string `toml:"description"`
-	Prompt      string `toml:"prompt"`      // prompt template (mutually exclusive with Exec)
-	Exec        string `toml:"exec"`        // shell command to execute (mutually exclusive with Prompt)
-	WorkDir     string `toml:"work_dir"`    // optional: working directory for exec command
+	Prompt      string `toml:"prompt"`   // prompt template (mutually exclusive with Exec)
+	Exec        string `toml:"exec"`     // shell command to execute (mutually exclusive with Prompt)
+	WorkDir     string `toml:"work_dir"` // optional: working directory for exec command
 }
 
 type LogConfig struct {
@@ -175,6 +181,9 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	if c.Relay.TimeoutSecs != nil && *c.Relay.TimeoutSecs < 0 {
+		return fmt.Errorf("config: relay.timeout_secs must be >= 0")
+	}
 	if len(c.Projects) == 0 {
 		return fmt.Errorf("config: at least one [[projects]] entry is required")
 	}

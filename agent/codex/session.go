@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -104,17 +105,30 @@ func (cs *codexSession) buildExecArgs(prompt string) []string {
 	isResume := tid != ""
 
 	var args []string
-	if isResume {
-		args = []string{"exec", "resume", "--json", "--skip-git-repo-check"}
-	} else {
-		args = []string{"exec", "--json", "--skip-git-repo-check"}
-	}
-
 	switch cs.mode {
-	case "auto-edit", "full-auto":
-		args = append(args, "--full-auto")
+	case "suggest":
+		args = append(args,
+			"-c", `approval_policy="untrusted"`,
+			"-c", `sandbox_mode="read-only"`,
+		)
+	case "auto-edit":
+		args = append(args,
+			"-c", `approval_policy="on-request"`,
+			"-c", `sandbox_mode="workspace-write"`,
+		)
+	case "full-auto":
+		args = append(args,
+			"-c", `approval_policy="never"`,
+			"-c", `sandbox_mode="workspace-write"`,
+		)
 	case "yolo":
 		args = append(args, "--dangerously-bypass-approvals-and-sandbox")
+	}
+
+	if isResume {
+		args = append(args, "exec", "resume", "--json", "--skip-git-repo-check")
+	} else {
+		args = append(args, "exec", "--json", "--skip-git-repo-check")
 	}
 
 	if cs.model != "" {
@@ -152,33 +166,54 @@ func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 		}
 	}()
 
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
+	if err := readJSONLines(stdout, func(line []byte) error {
+		lineText := string(line)
+		if lineText == "" {
+			return nil
 		}
 
-		slog.Debug("codexSession: raw", "line", truncate(line, 500))
+		slog.Debug("codexSession: raw", "line", truncate(lineText, 500))
 
 		var raw map[string]any
-		if err := json.Unmarshal([]byte(line), &raw); err != nil {
-			slog.Debug("codexSession: non-JSON line", "line", line)
-			continue
+		if err := json.Unmarshal(line, &raw); err != nil {
+			slog.Debug("codexSession: non-JSON line", "line", lineText)
+			return nil
 		}
 
 		cs.handleEvent(raw)
-	}
-
-	if err := scanner.Err(); err != nil {
-		slog.Error("codexSession: scanner error", "error", err)
+		return nil
+	}); err != nil {
+		slog.Error("codexSession: read stdout error", "error", err)
 		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}
 		select {
 		case cs.events <- evt:
 		case <-cs.ctx.Done():
 			return
+		}
+	}
+}
+
+func readJSONLines(r io.Reader, handle func([]byte) error) error {
+	reader := bufio.NewReader(r)
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if errors.Is(err, io.EOF) && len(line) == 0 {
+			return nil
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+
+		line = bytes.TrimRight(line, "\r\n")
+		if len(line) > 0 {
+			if err := handle(line); err != nil {
+				return err
+			}
+		}
+
+		if errors.Is(err, io.EOF) {
+			return nil
 		}
 	}
 }
@@ -228,6 +263,9 @@ func (cs *codexSession) handleEvent(raw map[string]any) {
 			return
 		}
 
+	case "permission_request":
+		cs.handlePermissionRequest(raw)
+
 	case "error":
 		msg, _ := raw["message"].(string)
 		if strings.Contains(msg, "Reconnecting") || strings.Contains(msg, "Falling back") {
@@ -238,6 +276,31 @@ func (cs *codexSession) handleEvent(raw map[string]any) {
 
 	default:
 		slog.Debug("codexSession: unhandled event type", "type", eventType)
+	}
+}
+
+func (cs *codexSession) handlePermissionRequest(raw map[string]any) {
+	toolName, _ := raw["tool_name"].(string)
+	if toolName == "" {
+		toolName, _ = raw["name"].(string)
+	}
+	requestID, _ := raw["request_id"].(string)
+	params, _ := raw["parameters"].(map[string]any)
+	if params == nil {
+		params, _ = raw["input"].(map[string]any)
+	}
+
+	input := formatPermissionPreview(toolName, params)
+	evt := core.Event{
+		Type:         core.EventPermissionRequest,
+		ToolName:     toolName,
+		ToolInput:    input,
+		ToolInputRaw: params,
+		RequestID:    requestID,
+	}
+	select {
+	case cs.events <- evt:
+	case <-cs.ctx.Done():
 	}
 }
 
@@ -414,9 +477,25 @@ func codexExtractToolInput(item map[string]any) string {
 	return ""
 }
 
-// RespondPermission is a no-op for Codex — permissions are handled via CLI flags.
+func formatPermissionPreview(toolName string, params map[string]any) string {
+	if len(params) == 0 {
+		return ""
+	}
+	if toolName == "exec_command" || toolName == "Bash" {
+		if cmd, _ := params["cmd"].(string); cmd != "" {
+			return cmd
+		}
+	}
+	b, err := json.Marshal(params)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// Codex exec mode does not expose a stdin approval response channel.
 func (cs *codexSession) RespondPermission(_ string, _ core.PermissionResult) error {
-	return nil
+	return fmt.Errorf("codex: permission responses are not supported in exec mode")
 }
 
 func (cs *codexSession) Events() <-chan core.Event {

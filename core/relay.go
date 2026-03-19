@@ -31,10 +31,12 @@ type RelayBinding struct {
 
 // RelayManager coordinates bot-to-bot message relay across engines.
 type RelayManager struct {
-	mu        sync.RWMutex
-	engines   map[string]*Engine       // project name → engine (runtime only)
-	bindings  map[string]*RelayBinding // chatID → binding
-	storePath string                   // empty = no persistence
+	mu         sync.RWMutex
+	engines    map[string]*Engine       // project name → engine (runtime only)
+	bindings   map[string]*RelayBinding // chatID → binding
+	storePath  string                   // empty = no persistence
+	timeout    time.Duration
+	timeoutSet bool
 }
 
 func NewRelayManager(dataDir string) *RelayManager {
@@ -53,6 +55,17 @@ func (rm *RelayManager) RegisterEngine(name string, e *Engine) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	rm.engines[name] = e
+}
+
+// SetTimeout overrides the relay response timeout. Set to 0 to disable it.
+func (rm *RelayManager) SetTimeout(d time.Duration) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	if d < 0 {
+		d = 0
+	}
+	rm.timeout = d
+	rm.timeoutSet = true
 }
 
 // Bind establishes a relay binding between bots in a group chat.
@@ -226,7 +239,7 @@ func (rm *RelayManager) Send(ctx context.Context, req RelayRequest) (*RelayRespo
 	}
 
 	// Execute relay: inject message into target engine and collect response
-	relayCtx, cancel := context.WithTimeout(ctx, relayTimeoutForProject(req.To))
+	relayCtx, cancel := rm.relayContext(ctx, req.To)
 	defer cancel()
 
 	response, err := targetEngine.HandleRelay(relayCtx, req.From, chatID, req.Message)
@@ -271,6 +284,21 @@ func truncateRelay(s string, maxLen int) string {
 		return s
 	}
 	return string(runes[:maxLen]) + "…"
+}
+
+func (rm *RelayManager) relayContext(ctx context.Context, project string) (context.Context, context.CancelFunc) {
+	rm.mu.RLock()
+	timeout := rm.timeout
+	timeoutSet := rm.timeoutSet
+	rm.mu.RUnlock()
+
+	if !timeoutSet {
+		return context.WithTimeout(ctx, relayTimeoutForProject(project))
+	}
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func parseSessionKeyParts(sessionKey string) (platform, chatID string, err error) {

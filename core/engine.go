@@ -614,7 +614,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	// Resolve aliases: check if the first word (or whole content) matches an alias
 	content = e.resolveAlias(content)
 	msg.Content = content
-	if strings.Contains(strings.ToLower(content), "sendto") {
+	if _, ok := extractSendToArgs(content); ok {
 		slog.Info("sendto: content seen in message", "project", e.name, "session", msg.SessionKey, "content", content)
 	}
 
@@ -1349,7 +1349,7 @@ var builtinCommands = []struct {
 	{[]string{"shell", "sh", "exec", "run"}, "shell"},
 	{[]string{"tts"}, "tts"},
 	{[]string{"usage", "tokens", "token"}, "usage"},
-	{[]string{"sendto", "quote", "fwd"}, "sendto"},
+	{[]string{"sendto", "quote", "st", "sd"}, "sendto"},
 }
 
 // matchPrefix finds a unique command matching the given prefix.
@@ -1758,7 +1758,7 @@ func (e *Engine) cmdShell(p Platform, msg *Message, raw string) {
 			workDir, _ = os.Getwd()
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(e.ctx, 60*time.Second)
 		defer cancel()
 
 		cmd := exec.CommandContext(ctx, "sh", "-c", shellCmd)
@@ -2042,14 +2042,13 @@ func (e *Engine) cmdSendTo(p Platform, msg *Message, args []string) {
 
 func extractSendToArgs(content string) ([]string, bool) {
 	content = strings.TrimSpace(content)
-	lower := strings.ToLower(content)
-	idx := strings.Index(lower, "sendto")
-	if idx < 0 {
+	idx, cmdLen, ok := findEmbeddedSendToCommand(content)
+	if !ok {
 		return nil, false
 	}
 
 	prefix := strings.TrimSpace(strings.TrimRight(strings.TrimSpace(content[:idx]), "/"))
-	tail := strings.TrimLeft(content[idx+len("sendto"):], " /\t\n")
+	tail := strings.TrimLeft(content[idx+cmdLen:], " /\t\n")
 	args := strings.Fields(tail)
 	if prefix != "" {
 		if containsSendToTargetToken(args) {
@@ -2059,6 +2058,35 @@ func extractSendToArgs(content string) ([]string, bool) {
 		}
 	}
 	return args, true
+}
+
+func findEmbeddedSendToCommand(content string) (idx int, cmdLen int, ok bool) {
+	lower := strings.ToLower(content)
+	bestIdx := -1
+	bestLen := 0
+	for _, name := range []string{"sendto", "quote", "st", "sd"} {
+		needle := "/" + name
+		pos := strings.Index(lower, needle)
+		if pos < 0 {
+			continue
+		}
+		end := pos + len(needle)
+		if end < len(lower) {
+			switch lower[end] {
+			case ' ', '\t', '\n', '@':
+			default:
+				continue
+			}
+		}
+		if bestIdx == -1 || pos < bestIdx {
+			bestIdx = pos
+			bestLen = len(needle)
+		}
+	}
+	if bestIdx < 0 {
+		return 0, 0, false
+	}
+	return bestIdx, bestLen, true
 }
 
 const sendToWindow = time.Minute
@@ -5072,7 +5100,7 @@ func (e *Engine) executeShellCommand(p Platform, msg *Message, cmd *CustomComman
 	}
 
 	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(e.ctx, 60*time.Second)
 	defer cancel()
 
 	// Execute command using shell
@@ -5805,12 +5833,6 @@ func (e *Engine) sendTTSReply(p Platform, replyCtx any, text string) {
 // dedicated relay session, sends the message to the agent, and blocks until
 // the complete response is collected.
 func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message string) (string, error) {
-	if strings.EqualFold(e.name, "gemini") {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, geminiRelayTimeout)
-		defer cancel()
-	}
-
 	relaySessionKey := "relay:" + fromProject + ":" + chatID
 	session := e.sessions.GetOrCreateActive(relaySessionKey)
 
@@ -5848,9 +5870,12 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 		select {
 		case <-ctx.Done():
 			slog.Warn("relay: context done", "from", fromProject, "to", e.name, "error", ctx.Err())
-			return "", ctx.Err()
+			return relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
 		case event, ok := <-events:
 			if !ok {
+				if ctx.Err() != nil {
+					return relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
+				}
 				if len(textParts) > 0 {
 					return strings.Join(textParts, ""), nil
 				}
@@ -5893,6 +5918,21 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 			}
 		}
 	}
+}
+
+func relayPartialResponseOrError(ctxErr error, textParts []string, fromProject, toProject string) (string, error) {
+	if len(textParts) == 0 {
+		return "", ctxErr
+	}
+
+	resp := strings.Join(textParts, "")
+	slog.Warn("relay: context done before final result; returning partial response",
+		"from", fromProject,
+		"to", toProject,
+		"error", ctxErr,
+		"response_len", len(resp),
+	)
+	return resp, nil
 }
 
 // cmdBind handles /bind — establishes a relay binding between bots in a group chat.

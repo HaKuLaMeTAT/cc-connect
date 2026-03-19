@@ -254,3 +254,24 @@ func TestSplitMessageCodeFenceAware_NoCodeBlock(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitMessageCodeFenceAware_ChunkDoesNotExceedMaxLen(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("```go\n")
+	for i := 0; i < 30; i++ {
+		sb.WriteString(fmt.Sprintf("line %d: some code content here\n", i))
+	}
+	sb.WriteString("```\n")
+	text := sb.String()
+
+	maxLen := 100
+	chunks := SplitMessageCodeFenceAware(text, maxLen)
+	if len(chunks) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(chunks))
+	}
+	for i, chunk := range chunks {
+		if len(chunk) > maxLen {
+			t.Errorf("chunk %d exceeds maxLen (%d): len=%d, content=%q", i, maxLen, len(chunk), chunk)
+		}
+	}
+}
