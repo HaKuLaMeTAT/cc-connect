@@ -53,7 +53,7 @@ func newCodexSession(ctx context.Context, workDir, model, effort, mode, resumeID
 	}
 	cs.alive.Store(true)
 
-	if resumeID != "" {
+	if resumeID != "" && resumeID != core.ContinueSession {
 		cs.threadID.Store(resumeID)
 	}
 
@@ -139,6 +139,7 @@ func (cs *codexSession) buildExecArgs(prompt string) []string {
 	}
 
 	if isResume {
+		// `codex exec resume` does not accept `--cd`; cmd.Dir already sets cwd.
 		args = append(args, tid, prompt)
 	} else {
 		args = append(args, "--cd", cs.workDir, prompt)

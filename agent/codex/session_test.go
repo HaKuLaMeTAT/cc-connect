@@ -101,6 +101,25 @@ func TestBuildExecArgs_AutoEditUsesWorkspaceWriteSandbox(t *testing.T) {
 	}
 }
 
+func TestBuildExecArgs_ResumeOmitsCdFlag(t *testing.T) {
+	cs, err := newCodexSession(context.Background(), "/tmp/project", "", "", "full-auto", "thread-abc", nil)
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+
+	args := cs.buildExecArgs("hello")
+
+	for i, arg := range args {
+		if arg == "--cd" {
+			t.Fatalf("resume args should not contain --cd, but found at index %d: %v", i, args)
+		}
+	}
+
+	if !containsSequence(args, []string{"exec", "resume", "--json", "--skip-git-repo-check", "thread-abc", "hello"}) {
+		t.Fatalf("resume args missing expected sequence: %v", args)
+	}
+}
+
 func TestBuildExecArgs_SuggestUsesUntrustedReadOnly(t *testing.T) {
 	cs, err := newCodexSession(context.Background(), "/tmp/project", "", "", "suggest", "", nil)
 	if err != nil {
@@ -235,5 +254,36 @@ func TestSend_HandlesLargeJSONLines(t *testing.T) {
 	}
 	if got := cs.CurrentSessionID(); got != "thread-large" {
 		t.Fatalf("CurrentSessionID() = %q, want thread-large", got)
+	}
+}
+
+func containsSequence(args, want []string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	for i := 0; i+len(want) <= len(args); i++ {
+		match := true
+		for j := range want {
+			if args[i+j] != want[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCodexSession_ContinueSessionTreatedAsFresh(t *testing.T) {
+	s, err := newCodexSession(context.Background(), "/tmp", "", "", "full-auto", core.ContinueSession, nil)
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+	defer s.Close()
+
+	if got := s.CurrentSessionID(); got != "" {
+		t.Errorf("ContinueSession should be treated as fresh: threadID = %q, want empty", got)
 	}
 }
