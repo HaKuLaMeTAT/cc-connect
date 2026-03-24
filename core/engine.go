@@ -3165,7 +3165,7 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 	if e.modelSaveFunc != nil {
 		if err := e.modelSaveFunc(target); err != nil {
 			slog.Error("failed to save model", "model", target, "error", err)
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChangeFailed, err))
 			return
 		}
 	}
