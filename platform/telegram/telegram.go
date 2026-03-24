@@ -636,6 +636,9 @@ func (p *Platform) downloadFile(fileID string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get file: %w", err)
 	}
+	if file.FilePath == "" {
+		return nil, fmt.Errorf("get file: empty file_path returned for file_id %s", fileID)
+	}
 	link := file.Link(p.bot.Token)
 
 	resp, err := p.httpClient.Get(link)
@@ -643,6 +646,9 @@ func (p *Platform) downloadFile(fileID string) ([]byte, error) {
 		return nil, fmt.Errorf("download: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download file %s: status %d", fileID, resp.StatusCode)
+	}
 	return io.ReadAll(resp.Body)
 }
 
