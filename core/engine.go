@@ -1506,17 +1506,23 @@ func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
 	slog.Info("cmdNew: cleaning up old session", "session_key", msg.SessionKey)
 	e.cleanupInteractiveState(msg.SessionKey)
 	slog.Info("cmdNew: cleanup done, creating new session", "session_key", msg.SessionKey)
+
+	// Clear old session's agent session ID so it cannot be resumed
+	s := e.sessions.GetOrCreateActive(msg.SessionKey)
+	s.SetAgentSessionID("")
+	s.ClearHistory()
+	e.sessions.Save()
+
 	name := ""
 	if len(args) > 0 {
 		name = strings.Join(args, " ")
 	}
-	s := e.sessions.NewSession(msg.SessionKey, name)
+	s = e.sessions.NewSession(msg.SessionKey, name)
 	if name != "" {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgNewSessionCreatedName), name))
 	} else {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNewSessionCreated))
 	}
-	_ = s
 }
 
 const listPageSize = 20
