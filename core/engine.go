@@ -933,7 +933,8 @@ func (e *Engine) getOrCreateInteractiveState(sessionKey string, p Platform, repl
 	if ok && state.agentSession != nil && state.agentSession.Alive() {
 		wantID := session.GetAgentSessionID()
 		haveID := state.agentSession.CurrentSessionID()
-		if wantID == "" || haveID == "" || wantID == haveID {
+		needRecycle := haveID != "" && (wantID == "" || wantID != haveID)
+		if !needRecycle {
 			return state
 		}
 		slog.Info("interactive session mismatch, recycling",

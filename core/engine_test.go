@@ -253,6 +253,50 @@ func (s *stubBlockingSession) CurrentSessionID() string                         
 func (s *stubBlockingSession) Alive() bool                                          { return true }
 func (s *stubBlockingSession) Close() error                                         { return nil }
 
+type recycleTestAgent struct {
+	nextSession *recycleTestSession
+}
+
+func (a *recycleTestAgent) Name() string { return "recycle" }
+func (a *recycleTestAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
+	return a.nextSession, nil
+}
+func (a *recycleTestAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *recycleTestAgent) Stop() error { return nil }
+
+type recycleTestSession struct {
+	id     string
+	alive  bool
+	closed chan struct{}
+}
+
+func newRecycleTestSession(id string) *recycleTestSession {
+	return &recycleTestSession{
+		id:     id,
+		alive:  true,
+		closed: make(chan struct{}),
+	}
+}
+
+func (s *recycleTestSession) Send(_ string, _ []ImageAttachment) error             { return nil }
+func (s *recycleTestSession) RespondPermission(_ string, _ PermissionResult) error { return nil }
+func (s *recycleTestSession) Events() <-chan Event {
+	ch := make(chan Event)
+	close(ch)
+	return ch
+}
+func (s *recycleTestSession) CurrentSessionID() string { return s.id }
+func (s *recycleTestSession) Alive() bool              { return s.alive }
+func (s *recycleTestSession) Close() error {
+	if s.alive {
+		s.alive = false
+		close(s.closed)
+	}
+	return nil
+}
+
 func newTestEngine() *Engine {
 	return NewEngine("test", &stubAgent{}, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
 }
@@ -1458,5 +1502,71 @@ func TestHandleCardNav_HelpSwitchesTabs(t *testing.T) {
 	}
 	if strings.Contains(text, "**/new**") {
 		t.Fatalf("agent help text = %q, should not include session commands", text)
+	}
+}
+
+func TestSessionMismatch_RecyclesStaleAgent(t *testing.T) {
+	newSess := newRecycleTestSession("new-agent-id")
+	agent := &recycleTestAgent{nextSession: newSess}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	oldSess := newRecycleTestSession("old-agent-id")
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{
+		agentSession: oldSess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Unlock()
+
+	session := &Session{AgentSessionID: "new-agent-id"}
+	state := e.getOrCreateInteractiveState(key, p, "ctx", session)
+
+	if state.agentSession == oldSess {
+		t.Fatal("expected stale agent session to be replaced")
+	}
+	if state.agentSession != newSess {
+		t.Fatal("expected new agent session from StartSession")
+	}
+
+	select {
+	case <-oldSess.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old agent session was not closed after mismatch")
+	}
+}
+
+func TestSessionClearedAfterNew_RecyclesAliveAgent(t *testing.T) {
+	newSess := newRecycleTestSession("fresh-id")
+	agent := &recycleTestAgent{nextSession: newSess}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	oldSess := newRecycleTestSession("prior-session")
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{
+		agentSession: oldSess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Unlock()
+
+	session := &Session{}
+	state := e.getOrCreateInteractiveState(key, p, "ctx", session)
+
+	if state.agentSession == oldSess {
+		t.Fatal("expected stale agent to be recycled when AgentSessionID was cleared")
+	}
+	if state.agentSession != newSess {
+		t.Fatal("expected new agent session from StartSession")
+	}
+
+	select {
+	case <-oldSess.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old agent session was not closed after /new-style clear")
 	}
 }
