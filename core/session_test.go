@@ -1,6 +1,7 @@
 package core
 
 import (
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -190,5 +191,92 @@ func TestSession_ConcurrentHistory(t *testing.T) {
 	wg.Wait()
 	if h := s.GetHistory(0); len(h) != 50 {
 		t.Errorf("expected 50 entries, got %d", len(h))
+	}
+}
+
+func TestSession_SetAgentSessionID_RejectsContinueSentinel(t *testing.T) {
+	s := &Session{}
+	s.SetAgentSessionID("real-id")
+	s.SetAgentSessionID(ContinueSession)
+	if got := s.GetAgentSessionID(); got != "real-id" {
+		t.Fatalf("GetAgentSessionID = %q, want real-id", got)
+	}
+	s.SetAgentSessionID("")
+	if got := s.GetAgentSessionID(); got != "" {
+		t.Fatalf("GetAgentSessionID after clear = %q, want empty", got)
+	}
+}
+
+func TestSession_CompareAndSetAgentSessionID_ReplacesContinueSentinel(t *testing.T) {
+	s := &Session{}
+	s.mu.Lock()
+	s.AgentSessionID = ContinueSession
+	s.mu.Unlock()
+
+	if !s.CompareAndSetAgentSessionID("real-id") {
+		t.Fatal("expected CompareAndSetAgentSessionID to replace ContinueSession")
+	}
+	if got := s.GetAgentSessionID(); got != "real-id" {
+		t.Fatalf("GetAgentSessionID = %q, want real-id", got)
+	}
+	if s.CompareAndSetAgentSessionID("another-id") {
+		t.Fatal("expected CompareAndSetAgentSessionID to fail once a real id is set")
+	}
+}
+
+func TestSession_SetAgentInfo_NormalizesContinueSentinel(t *testing.T) {
+	s := &Session{}
+	s.SetAgentInfo(ContinueSession, "demo")
+	if got := s.GetAgentSessionID(); got != "" {
+		t.Fatalf("GetAgentSessionID = %q, want empty", got)
+	}
+	if got := s.GetName(); got != "demo" {
+		t.Fatalf("GetName = %q, want demo", got)
+	}
+}
+
+func TestSessionManager_Load_StripsContinueSentinel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sessions.json")
+	raw := `{
+  "sessions": {
+    "s1": {
+      "id": "s1",
+      "name": "default",
+      "agent_session_id": "__continue__",
+      "history": [],
+      "created_at": "2020-01-01T00:00:00Z",
+      "updated_at": "2020-01-01T00:00:00Z"
+    }
+  },
+  "active_session": {"user1": "s1"},
+  "user_sessions": {"user1": ["s1"]},
+  "counter": 1
+}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	sm := NewSessionManager(path)
+	if got := sm.GetOrCreateActive("user1").GetAgentSessionID(); got != "" {
+		t.Fatalf("GetAgentSessionID = %q, want empty", got)
+	}
+}
+
+func TestSessionManager_Save_StripsContinueSentinel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sessions.json")
+
+	sm := NewSessionManager(path)
+	sm.NewSession("user1", "persisted")
+	s := sm.GetOrCreateActive("user1")
+	s.mu.Lock()
+	s.AgentSessionID = ContinueSession
+	s.mu.Unlock()
+	sm.Save()
+
+	reloaded := NewSessionManager(path)
+	if got := reloaded.GetOrCreateActive("user1").GetAgentSessionID(); got != "" {
+		t.Fatalf("GetAgentSessionID after reload = %q, want empty", got)
 	}
 }

@@ -993,8 +993,9 @@ func (e *Engine) getOrCreateInteractiveState(sessionKey string, p Platform, repl
 		return state
 	}
 
+	startSessionID := session.GetAgentSessionID()
 	startAt := time.Now()
-	agentSession, err := e.agent.StartSession(e.ctx, session.AgentSessionID)
+	agentSession, err := e.agent.StartSession(e.ctx, startSessionID)
 	startElapsed := time.Since(startAt)
 	if err != nil {
 		slog.Error("failed to start interactive session", "error", err, "elapsed", startElapsed)
@@ -1003,7 +1004,10 @@ func (e *Engine) getOrCreateInteractiveState(sessionKey string, p Platform, repl
 		return state
 	}
 	if startElapsed >= slowAgentStart {
-		slog.Warn("slow agent session start", "elapsed", startElapsed, "agent", e.agent.Name(), "session_id", session.AgentSessionID)
+		slog.Warn("slow agent session start", "elapsed", startElapsed, "agent", e.agent.Name(), "session_id", startSessionID)
+	}
+	if newID := agentSession.CurrentSessionID(); newID != "" && session.CompareAndSetAgentSessionID(newID) {
+		e.sessions.Save()
 	}
 
 	state = &interactiveState{
@@ -1014,7 +1018,7 @@ func (e *Engine) getOrCreateInteractiveState(sessionKey string, p Platform, repl
 	}
 	e.interactiveStates[sessionKey] = state
 
-	slog.Info("interactive session started", "session_key", sessionKey, "agent_session", session.AgentSessionID, "elapsed", startElapsed)
+	slog.Info("interactive session started", "session_key", sessionKey, "agent_session", session.GetAgentSessionID(), "elapsed", startElapsed)
 	return state
 }
 

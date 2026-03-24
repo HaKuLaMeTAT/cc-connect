@@ -52,6 +52,9 @@ func (s *Session) AddHistory(role, content string) {
 
 // SetAgentInfo atomically updates the agent session ID and display name.
 func (s *Session) SetAgentInfo(agentSessionID, name string) {
+	if agentSessionID == ContinueSession {
+		agentSessionID = ""
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.AgentSessionID = agentSessionID
@@ -60,16 +63,23 @@ func (s *Session) SetAgentInfo(agentSessionID, name string) {
 
 // SetAgentSessionID atomically updates the agent session ID.
 func (s *Session) SetAgentSessionID(id string) {
+	if id == ContinueSession {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.AgentSessionID = id
 }
 
-// CompareAndSetAgentSessionID sets the session ID only when it is currently empty.
+// CompareAndSetAgentSessionID sets the session ID only when it is currently empty
+// or still holds the transient ContinueSession sentinel.
 func (s *Session) CompareAndSetAgentSessionID(id string) bool {
+	if id == "" || id == ContinueSession {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.AgentSessionID != "" {
+	if s.AgentSessionID != "" && s.AgentSessionID != ContinueSession {
 		return false
 	}
 	s.AgentSessionID = id
@@ -94,6 +104,14 @@ func (s *Session) ClearHistory() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.History = nil
+}
+
+func (s *Session) stripContinueSessionSentinel() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.AgentSessionID == ContinueSession {
+		s.AgentSessionID = ""
+	}
 }
 
 // GetHistory returns the last n entries. If n <= 0, returns all.
@@ -261,10 +279,15 @@ func (sm *SessionManager) saveLocked() {
 	snapSessions := make(map[string]*Session, len(sm.sessions))
 	for id, s := range sm.sessions {
 		s.mu.Lock()
+		agentSessionID := s.AgentSessionID
+		if agentSessionID == ContinueSession {
+			agentSessionID = ""
+			s.AgentSessionID = ""
+		}
 		snapSessions[id] = &Session{
 			ID:             s.ID,
 			Name:           s.Name,
-			AgentSessionID: s.AgentSessionID,
+			AgentSessionID: agentSessionID,
 			History:        append([]HistoryEntry(nil), s.History...),
 			CreatedAt:      s.CreatedAt,
 			UpdatedAt:      s.UpdatedAt,
@@ -323,6 +346,9 @@ func (sm *SessionManager) load() {
 	}
 	if sm.sessionNames == nil {
 		sm.sessionNames = make(map[string]string)
+	}
+	for _, s := range sm.sessions {
+		s.stripContinueSessionSentinel()
 	}
 
 	slog.Info("session: loaded from disk", "path", sm.storePath, "sessions", len(sm.sessions))
