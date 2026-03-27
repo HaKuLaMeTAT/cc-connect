@@ -982,7 +982,7 @@ func TestRenderModelCard_IncludesReasoningShortcut(t *testing.T) {
 	agent := &stubModelModeAgent{model: "gpt-4.1", reasoningEffort: "medium"}
 	e := NewEngine("test", agent, []Platform{&stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "card"}}}, "", LangEnglish)
 
-	card := e.renderModelCard()
+	card := e.renderModelCard("")
 	text := card.RenderText()
 	if !strings.Contains(text, "Current model: gpt-4.1") {
 		t.Fatalf("card text = %q, want current model", text)

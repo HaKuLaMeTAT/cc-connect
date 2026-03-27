@@ -1071,6 +1071,9 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 	if ps, ok := e.agent.(ProviderSwitcher); ok {
 		if ps2, ok2 := agent.(ProviderSwitcher); ok2 {
 			ps2.SetProviders(ps.ListProviders())
+			if active := ps.GetActiveProvider(); active != nil && active.Name != "" {
+				ps2.SetActiveProvider(active.Name)
+			}
 		}
 	}
 
@@ -3462,7 +3465,13 @@ func (e *Engine) GetMenuCommands(platformName string) []BotCommandInfo {
 }
 
 func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
-	switcher, ok := e.agent.(ModelSwitcher)
+	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return
+	}
+
+	switcher, ok := agent.(ModelSwitcher)
 	if !ok {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgModelNotSupported))
 		return
@@ -3528,7 +3537,7 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 			e.replyWithButtons(p, msg.ReplyCtx, sb.String(), buttons)
 			return
 		}
-		e.replyWithCard(p, msg.ReplyCtx, e.renderModelCard())
+		e.replyWithCard(p, msg.ReplyCtx, e.renderModelCard(msg.SessionKey))
 		return
 	}
 
@@ -3541,7 +3550,7 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 		target = models[idx-1].Name
 	}
 
-	if e.modelSaveFunc != nil {
+	if agent == e.agent && e.modelSaveFunc != nil {
 		if err := e.modelSaveFunc(target); err != nil {
 			slog.Error("failed to save model", "model", target, "error", err)
 			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChangeFailed, err))
@@ -3550,12 +3559,12 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 	}
 
 	switcher.SetModel(target)
-	e.cleanupInteractiveState(e.interactiveKeyForSessionKey(msg.SessionKey))
+	e.cleanupInteractiveState(interactiveKey)
 
-	s := e.sessions.GetOrCreateActive(msg.SessionKey)
+	s := sessions.GetOrCreateActive(msg.SessionKey)
 	s.SetAgentSessionID("")
 	s.ClearHistory()
-	e.sessions.Save()
+	sessions.Save()
 
 	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChanged, target))
 }
@@ -4426,7 +4435,7 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		}
 		return e.renderHelpGroupCardForPlatform(platform, args)
 	case "/model":
-		return e.renderModelCard()
+		return e.renderModelCard(sessionKey)
 	case "/reasoning":
 		return e.renderReasoningCard()
 	case "/mode":
@@ -4485,7 +4494,8 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		if args == "" {
 			return
 		}
-		switcher, ok := e.agent.(ModelSwitcher)
+		agent, sessions := e.sessionContextForKey(sessionKey)
+		switcher, ok := agent.(ModelSwitcher)
 		if !ok {
 			return
 		}
@@ -4496,18 +4506,19 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		if idx, err := strconv.Atoi(target); err == nil && idx >= 1 && idx <= len(models) {
 			target = models[idx-1].Name
 		}
-		if e.modelSaveFunc != nil {
+		if agent == e.agent && e.modelSaveFunc != nil {
 			if err := e.modelSaveFunc(target); err != nil {
 				slog.Error("failed to save model from card action", "model", target, "error", err)
 				return
 			}
 		}
 		switcher.SetModel(target)
-		e.cleanupInteractiveState(sessionKey)
-		s := e.sessions.GetOrCreateActive(sessionKey)
+		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+		e.cleanupInteractiveState(interactiveKey)
+		s := sessions.GetOrCreateActive(sessionKey)
 		s.SetAgentSessionID("")
 		s.ClearHistory()
-		e.sessions.Save()
+		sessions.Save()
 
 	case "/reasoning":
 		if args == "" {
@@ -4968,8 +4979,13 @@ func (e *Engine) renderLangCard() *Card {
 		Build()
 }
 
-func (e *Engine) renderModelCard() *Card {
-	switcher, ok := e.agent.(ModelSwitcher)
+func (e *Engine) renderModelCard(sessionKey string) *Card {
+	agent := e.agent
+	if sessionKey != "" {
+		agent, _ = e.sessionContextForKey(sessionKey)
+	}
+
+	switcher, ok := agent.(ModelSwitcher)
 	if !ok {
 		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelNotSupported))
 	}
