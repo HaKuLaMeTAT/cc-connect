@@ -57,7 +57,7 @@ func TestBuildExecArgs_IncludesReasoningEffort(t *testing.T) {
 		`model_reasoning_effort="high"`,
 		"--cd",
 		"/tmp/project",
-		"hello",
+		"-",
 	}
 	if len(args) != len(want) {
 		t.Fatalf("args len = %d, want %d, args=%v", len(args), len(want), args)
@@ -89,7 +89,7 @@ func TestBuildExecArgs_AutoEditUsesWorkspaceWriteSandbox(t *testing.T) {
 		"o3",
 		"--cd",
 		"/tmp/project",
-		"hello",
+		"-",
 	}
 	if len(args) != len(want) {
 		t.Fatalf("args len = %d, want %d, args=%v", len(args), len(want), args)
@@ -115,7 +115,7 @@ func TestBuildExecArgs_ResumeOmitsCdFlag(t *testing.T) {
 		}
 	}
 
-	if !containsSequence(args, []string{"exec", "resume", "--json", "--skip-git-repo-check", "thread-abc", "hello"}) {
+	if !containsSequence(args, []string{"exec", "resume", "--json", "--skip-git-repo-check", "thread-abc", "-"}) {
 		t.Fatalf("resume args missing expected sequence: %v", args)
 	}
 }
@@ -138,7 +138,7 @@ func TestBuildExecArgs_SuggestUsesUntrustedReadOnly(t *testing.T) {
 		"--skip-git-repo-check",
 		"--cd",
 		"/tmp/project",
-		"hello",
+		"-",
 	}
 	if len(args) != len(want) {
 		t.Fatalf("args len = %d, want %d, args=%v", len(args), len(want), args)
@@ -257,6 +257,53 @@ func TestSend_HandlesLargeJSONLines(t *testing.T) {
 	}
 }
 
+func TestSend_UsesStdinForMultilinePrompt(t *testing.T) {
+	workDir := t.TempDir()
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	argsFile := filepath.Join(workDir, "args.txt")
+	stdinFile := filepath.Join(workDir, "stdin.txt")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$@\" > \"$CODEX_ARGS_FILE\"\n" +
+		"cat > \"$CODEX_STDIN_FILE\"\n" +
+		"printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-stdin\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"turn.completed\"}'\n"
+	scriptPath := filepath.Join(binDir, "codex")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+
+	t.Setenv("CODEX_ARGS_FILE", argsFile)
+	t.Setenv("CODEX_STDIN_FILE", stdinFile)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cs, err := newCodexSession(context.Background(), workDir, "", "", "", "thread-stdin", nil)
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+	defer cs.Close()
+
+	prompt := "line1\nline2"
+	if err := cs.Send(prompt, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	args := waitForFileLines(t, argsFile)
+	if !containsSequence(args, []string{"--json", "-"}) {
+		t.Fatalf("args missing stdin marker: %v", args)
+	}
+	data, err := waitForFileContent(stdinFile)
+	if err != nil {
+		t.Fatalf("wait for stdin file: %v", err)
+	}
+	if string(data) != prompt {
+		t.Fatalf("stdin content = %q, want %q", string(data), prompt)
+	}
+}
+
 func containsSequence(args, want []string) bool {
 	if len(want) == 0 {
 		return true
@@ -274,6 +321,39 @@ func containsSequence(args, want []string) bool {
 		}
 	}
 	return false
+}
+
+func waitForFileLines(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := waitForFileContent(path)
+	if err != nil {
+		t.Fatalf("wait for file lines: %v", err)
+	}
+	text := strings.TrimSpace(string(data))
+	if text == "" {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	args := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			args = append(args, line)
+		}
+	}
+	return args
+}
+
+func waitForFileContent(path string) ([]byte, error) {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return data, nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return nil, os.ErrNotExist
 }
 
 func TestCodexSession_ContinueSessionTreatedAsFresh(t *testing.T) {

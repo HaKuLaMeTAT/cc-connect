@@ -79,6 +79,7 @@ func (cs *codexSession) Send(prompt string, images []core.ImageAttachment) error
 
 	cmd := exec.CommandContext(cs.ctx, "codex", args...)
 	cmd.Dir = cs.workDir
+	cmd.Stdin = strings.NewReader(prompt)
 	if len(cs.extraEnv) > 0 {
 		cmd.Env = core.MergeEnv(os.Environ(), cs.extraEnv)
 	}
@@ -141,9 +142,9 @@ func (cs *codexSession) buildExecArgs(prompt string) []string {
 
 	if isResume {
 		// `codex exec resume` does not accept `--cd`; cmd.Dir already sets cwd.
-		args = append(args, tid, prompt)
+		args = append(args, tid, "-")
 	} else {
-		args = append(args, "--cd", cs.workDir, prompt)
+		args = append(args, "--cd", cs.workDir, "-")
 	}
 	return args
 }
