@@ -2985,8 +2985,9 @@ func (e *Engine) renderStatusCard(sessionKey string) *Card {
 	globalQuiet := e.quiet
 	e.quietMu.RUnlock()
 
+	iKey := e.interactiveKeyForSessionKey(sessionKey)
 	e.interactiveMu.Lock()
-	state, hasState := e.interactiveStates[sessionKey]
+	state, hasState := e.interactiveStates[iKey]
 	e.interactiveMu.Unlock()
 
 	sessionQuiet := false
@@ -4249,6 +4250,11 @@ func (e *Engine) SendToSession(sessionKey, message string) error {
 	var state *interactiveState
 	if sessionKey != "" {
 		state = e.interactiveStates[sessionKey]
+		if state == nil && e.multiWorkspace {
+			if iKey := e.interactiveKeyForSessionKey(sessionKey); iKey != sessionKey {
+				state = e.interactiveStates[iKey]
+			}
+		}
 	} else if len(e.interactiveStates) == 1 {
 		// Single session: use it when no sessionKey is provided (backward compatible)
 		for _, s := range e.interactiveStates {
