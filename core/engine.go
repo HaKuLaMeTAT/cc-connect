@@ -214,18 +214,22 @@ type queuedMessage struct {
 
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
-	agentSession    AgentSession
-	platform        Platform
-	replyCtx        any
-	workspaceDir    string
-	mu              sync.Mutex
-	pending         *pendingPermission
-	pendingMessages []queuedMessage // messages queued while session was busy
-	approveAll      bool            // when true, auto-approve all permission requests for this session
-	quiet           bool            // when true, suppress thinking and tool progress for this session
-	fromVoice       bool            // true if current turn originated from voice transcription
-	sideText        string
-	deleteMode      *deleteModeState
+	agentSession           AgentSession
+	platform               Platform
+	replyCtx               any
+	workspaceDir           string
+	mu                     sync.Mutex
+	stopCh                 chan struct{}
+	stopped                bool
+	pending                *pendingPermission
+	pendingMessages        []queuedMessage // messages queued while session was busy
+	approveAll             bool            // when true, auto-approve all permission requests for this session
+	quiet                  bool            // when true, suppress thinking and tool progress for this session
+	fromVoice              bool            // true if current turn originated from voice transcription
+	sideText               string
+	deleteMode             *deleteModeState
+	lastAutoCompressAt     time.Time
+	lastAutoCompressTokens int
 }
 
 type deleteModeState struct {
@@ -244,6 +248,37 @@ type pendingPermission struct {
 	InputPreview string
 	Resolved     chan struct{} // closed when user responds
 	resolveOnce  sync.Once
+}
+
+func (s *interactiveState) stopSignal() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopCh == nil {
+		s.stopCh = make(chan struct{})
+		if s.stopped {
+			close(s.stopCh)
+		}
+	}
+	return s.stopCh
+}
+
+func (s *interactiveState) isStopped() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopped
+}
+
+func (s *interactiveState) markStopped() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return
+	}
+	s.stopped = true
+	if s.stopCh == nil {
+		s.stopCh = make(chan struct{})
+	}
+	close(s.stopCh)
 }
 
 // resolve safely closes the Resolved channel exactly once.
@@ -1306,20 +1341,8 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 			"want_agent_session", wantID,
 			"have_agent_session", haveID,
 		)
-		closeStart := time.Now()
-		done := make(chan struct{})
-		go func() {
-			_ = state.agentSession.Close()
-			close(done)
-		}()
-		select {
-		case <-done:
-			if elapsed := time.Since(closeStart); elapsed >= slowAgentClose {
-				slog.Warn("slow agent session close", "elapsed", elapsed, "session", sessionKey)
-			}
-		case <-time.After(10 * time.Second):
-			slog.Error("agent session close timed out (10s), abandoning", "session", sessionKey)
-		}
+		state.markStopped()
+		e.closeAgentSessionAsync(sessionKey, state.agentSession)
 		delete(e.interactiveStates, sessionKey)
 		ok = false
 	}
@@ -1436,27 +1459,43 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 
 	// Notify senders of any queued messages that will never be processed.
 	if ok && state != nil {
+		state.markStopped()
 		e.notifyDroppedQueuedMessages(state, fmt.Errorf("session reset"))
 	}
 
 	if ok && state != nil && state.agentSession != nil {
-		slog.Debug("cleanupInteractiveState: closing agent session", "session", sessionKey)
-		closeStart := time.Now()
+		e.closeAgentSessionWithTimeout(sessionKey, state.agentSession)
+	}
+}
 
-		done := make(chan struct{})
-		go func() {
-			state.agentSession.Close()
-			close(done)
-		}()
+func (e *Engine) closeAgentSessionAsync(sessionKey string, agentSession AgentSession) {
+	if agentSession == nil {
+		return
+	}
+	go e.closeAgentSessionWithTimeout(sessionKey, agentSession)
+}
 
-		select {
-		case <-done:
-			if elapsed := time.Since(closeStart); elapsed >= slowAgentClose {
-				slog.Warn("slow agent session close", "elapsed", elapsed, "session", sessionKey)
-			}
-		case <-time.After(10 * time.Second):
-			slog.Error("agent session close timed out (10s), abandoning", "session", sessionKey)
+func (e *Engine) closeAgentSessionWithTimeout(sessionKey string, agentSession AgentSession) {
+	if agentSession == nil {
+		return
+	}
+
+	slog.Debug("cleanupInteractiveState: closing agent session", "session", sessionKey)
+	closeStart := time.Now()
+
+	done := make(chan struct{})
+	go func() {
+		agentSession.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if elapsed := time.Since(closeStart); elapsed >= slowAgentClose {
+			slog.Warn("slow agent session close", "elapsed", elapsed, "session", sessionKey)
 		}
+	case <-time.After(10 * time.Second):
+		slog.Error("agent session close timed out (10s), abandoning", "session", sessionKey)
 	}
 }
 
@@ -1491,11 +1530,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	}
 
 	events := state.agentSession.Events()
+	stopCh := state.stopSignal()
 	for {
 		var event Event
 		var ok bool
 
 		select {
+		case <-stopCh:
+			sp.discard()
+			return
 		case event, ok = <-events:
 			if !ok {
 				goto channelClosed
@@ -1512,6 +1555,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			e.cleanupInteractiveState(sessionKey)
 			return
 		case <-e.ctx.Done():
+			return
+		}
+
+		if state.isStopped() {
+			sp.discard()
 			return
 		}
 
@@ -4186,43 +4234,52 @@ func (e *Engine) cmdTTS(p Platform, msg *Message, args []string) {
 
 func (e *Engine) cmdStop(p Platform, msg *Message) {
 	iKey := e.interactiveKeyForSessionKey(msg.SessionKey)
-	e.interactiveMu.Lock()
-	state, ok := e.interactiveStates[iKey]
-	e.interactiveMu.Unlock()
-
-	if !ok || state == nil {
+	if !e.stopInteractiveSession(iKey, p, msg.ReplyCtx) {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNoExecution))
 		return
 	}
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgExecutionStopped))
+}
 
-	// Cancel pending permission if any
+func (e *Engine) stopInteractiveSession(sessionKey string, quietPlatform Platform, quietReplyCtx any) bool {
+	e.interactiveMu.Lock()
+	state, ok := e.interactiveStates[sessionKey]
+	if !ok || state == nil {
+		e.interactiveMu.Unlock()
+		return false
+	}
+
 	state.mu.Lock()
 	pending := state.pending
+	state.pending = nil
 	quietMode := state.quiet
-	if pending != nil {
-		state.pending = nil
-	}
+	agentSession := state.agentSession
 	state.mu.Unlock()
+
+	state.markStopped()
+	if quietMode {
+		if quietPlatform == nil {
+			quietPlatform = state.platform
+		}
+		if quietReplyCtx == nil {
+			quietReplyCtx = state.replyCtx
+		}
+		e.interactiveStates[sessionKey] = &interactiveState{
+			platform: quietPlatform,
+			replyCtx: quietReplyCtx,
+			quiet:    true,
+		}
+	} else {
+		delete(e.interactiveStates, sessionKey)
+	}
+	e.interactiveMu.Unlock()
+
 	if pending != nil {
 		pending.resolve()
 	}
-
-	e.cleanupInteractiveState(iKey)
-
-	// Preserve quiet preference across stop
-	if quietMode {
-		e.interactiveMu.Lock()
-		if s, ok := e.interactiveStates[iKey]; ok {
-			s.mu.Lock()
-			s.quiet = quietMode
-			s.mu.Unlock()
-		} else {
-			e.interactiveStates[iKey] = &interactiveState{platform: p, replyCtx: msg.ReplyCtx, quiet: quietMode}
-		}
-		e.interactiveMu.Unlock()
-	}
-
-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgExecutionStopped))
+	e.notifyDroppedQueuedMessages(state, fmt.Errorf("session reset"))
+	e.closeAgentSessionAsync(sessionKey, agentSession)
+	return true
 }
 
 func (e *Engine) cmdCompress(p Platform, msg *Message) {
@@ -4289,6 +4346,7 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 
 	var textParts []string
 	events := state.agentSession.Events()
+	stopCh := state.stopSignal()
 
 	var idleTimer *time.Timer
 	var idleCh <-chan time.Time
@@ -4303,6 +4361,8 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 		var ok bool
 
 		select {
+		case <-stopCh:
+			return
 		case event, ok = <-events:
 			if !ok {
 				e.cleanupInteractiveState(sessionKey)
@@ -4320,6 +4380,10 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("compress timed out"))
 			return
 		case <-e.ctx.Done():
+			return
+		}
+
+		if state.isStopped() {
 			return
 		}
 
@@ -5043,34 +5107,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 
 	case "/stop":
 		sessionKey = e.interactiveKeyForSessionKey(sessionKey)
-		e.interactiveMu.Lock()
-		state, ok := e.interactiveStates[sessionKey]
-		if !ok || state == nil {
-			e.interactiveMu.Unlock()
-			return
-		}
-		state.mu.Lock()
-		pending := state.pending
-		quietMode := state.quiet
-		agentSession := state.agentSession
-		if pending != nil {
-			state.pending = nil
-		}
-		state.agentSession = nil
-		state.mu.Unlock()
-		if quietMode {
-			e.interactiveStates[sessionKey] = &interactiveState{quiet: true}
-		} else {
-			delete(e.interactiveStates, sessionKey)
-		}
-		e.interactiveMu.Unlock()
-		if pending != nil {
-			pending.resolve()
-		}
-		if agentSession != nil {
-			slog.Debug("cleanupInteractiveState: closing agent session", "session", sessionKey)
-			go agentSession.Close()
-		}
+		e.stopInteractiveSession(sessionKey, nil, nil)
 	}
 }
 

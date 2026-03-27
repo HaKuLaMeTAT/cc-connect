@@ -234,6 +234,29 @@ func (sp *streamPreview) freeze() {
 	sp.degraded = true
 }
 
+// discard stops preview updates without emitting a final message.
+// It is used when a session is externally stopped mid-turn.
+func (sp *streamPreview) discard() {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	sp.cancelTimerLocked()
+
+	select {
+	case <-sp.timerStop:
+	default:
+		close(sp.timerStop)
+	}
+
+	if sp.previewMsgID != nil {
+		if cleaner, ok := sp.platform.(PreviewCleaner); ok {
+			_ = cleaner.DeletePreviewMessage(sp.ctx, sp.previewMsgID)
+		}
+	}
+
+	sp.degraded = true
+}
+
 // finish is called when the agent response is complete. It cancels any pending
 // timer and optionally cleans up the preview message.
 // Returns true if a preview was active and the final message was sent via preview
