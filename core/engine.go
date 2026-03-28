@@ -942,7 +942,20 @@ func (e *Engine) getOrCreateInteractiveState(sessionKey string, p Platform, repl
 			"want_agent_session", wantID,
 			"have_agent_session", haveID,
 		)
-		go state.agentSession.Close()
+		closeStart := time.Now()
+		done := make(chan struct{})
+		go func() {
+			_ = state.agentSession.Close()
+			close(done)
+		}()
+		select {
+		case <-done:
+			if elapsed := time.Since(closeStart); elapsed >= slowAgentClose {
+				slog.Warn("slow agent session close", "elapsed", elapsed, "session", sessionKey)
+			}
+		case <-time.After(10 * time.Second):
+			slog.Error("agent session close timed out (10s), abandoning", "session", sessionKey)
+		}
 		delete(e.interactiveStates, sessionKey)
 		ok = false
 	}
