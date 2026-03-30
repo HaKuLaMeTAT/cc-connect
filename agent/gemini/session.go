@@ -94,7 +94,6 @@ func (gs *geminiSession) buildArgs() []string {
 	if gs.model != "" {
 		args = append(args, "-m", gs.model)
 	}
-
 	return args
 }
 
@@ -149,10 +148,14 @@ func (gs *geminiSession) Send(prompt string, images []core.ImageAttachment) erro
 		gs.turnMu.Unlock()
 	}
 
-	// Gemini CLI supports @file references for images; save to temp files
+	// Save images inside the workspace so Gemini CLI tools can access them too.
 	var imageRefs []string
 	if len(images) > 0 {
-		tmpDir := os.TempDir()
+		attachDir := filepath.Join(gs.workDir, ".cc-connect", "attachments")
+		if err := os.MkdirAll(attachDir, 0o755); err != nil {
+			slog.Warn("geminiSession: failed to create attachment dir", "error", err)
+			attachDir = os.TempDir()
+		}
 		for i, img := range images {
 			ext := ".png"
 			switch img.MimeType {
@@ -163,8 +166,8 @@ func (gs *geminiSession) Send(prompt string, images []core.ImageAttachment) erro
 			case "image/webp":
 				ext = ".webp"
 			}
-			fname := fmt.Sprintf("cc-connect-img-%d%s", i, ext)
-			fpath := filepath.Join(tmpDir, fname)
+			fname := fmt.Sprintf("cc-connect-img-%d-%d%s", time.Now().UnixMilli(), i, ext)
+			fpath := filepath.Join(attachDir, fname)
 			if err := os.WriteFile(fpath, img.Data, 0o644); err != nil {
 				slog.Warn("geminiSession: failed to save image", "error", err)
 				continue
