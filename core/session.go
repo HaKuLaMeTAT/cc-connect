@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+const ContinueSession = "__continue__"
+
 // Session tracks one conversation between a user and the agent.
 type Session struct {
 	ID             string         `json:"id"`

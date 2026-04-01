@@ -362,7 +362,7 @@ while :; do sleep 1; done
 }
 
 func TestIFlowSession_ContinueSessionTreatedAsFresh(t *testing.T) {
-	s, err := newIFlowSession(context.Background(), "echo", "/tmp", "", "default", core.ContinueSession, nil, 0)
+	s, err := newIFlowSession(context.Background(), "echo", "/tmp", "", "default", core.ContinueSession, nil)
 	if err != nil {
 		t.Fatalf("newIFlowSession: %v", err)
 	}
