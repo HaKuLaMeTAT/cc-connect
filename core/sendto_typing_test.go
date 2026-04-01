@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -49,8 +50,10 @@ func (a *relayResultAgent) Name() string { return "relay-result" }
 func (a *relayResultAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
 	return &relayResultSession{events: make(chan Event, 1)}, nil
 }
-func (a *relayResultAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) { return nil, nil }
-func (a *relayResultAgent) Stop() error                                                { return nil }
+func (a *relayResultAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *relayResultAgent) Stop() error { return nil }
 
 type relayResultSession struct {
 	events chan Event
@@ -102,4 +105,45 @@ func TestSendToOtherBot_StartsAndStopsTypingIndicator(t *testing.T) {
 	targetPlatform.mu.Lock()
 	defer targetPlatform.mu.Unlock()
 	t.Fatalf("typing state mismatch: started=%d stopped=%d sent=%v", targetPlatform.started, targetPlatform.stopped, targetPlatform.sent)
+}
+
+func TestSendToOtherBot_UsesRelayManagerTimeout(t *testing.T) {
+	source := NewEngine("codex", &stubAgent{}, nil, "", LangEnglish)
+	targetPlatform := &relayTypingPlatform{}
+	target := NewEngine("gemini", &stubBlockingAgent{}, []Platform{targetPlatform}, "", LangEnglish)
+
+	rm := NewRelayManager("")
+	rm.SetTimeout(20 * time.Millisecond)
+	rm.RegisterEngine("codex", source)
+	rm.RegisterEngine("gemini", target)
+	source.SetRelayManager(rm)
+	target.SetRelayManager(rm)
+
+	if err := source.sendToOtherBot("telegram:123:456", "gemini", "hello"); err != nil {
+		t.Fatalf("sendToOtherBot returned error: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		targetPlatform.mu.Lock()
+		sent := append([]string(nil), targetPlatform.sent...)
+		started := targetPlatform.started
+		stopped := targetPlatform.stopped
+		targetPlatform.mu.Unlock()
+
+		if len(sent) > 0 {
+			if !strings.Contains(strings.ToLower(sent[len(sent)-1]), "deadline exceeded") {
+				t.Fatalf("timeout message = %q, want deadline exceeded", sent[len(sent)-1])
+			}
+			if started != 1 || stopped != 1 {
+				t.Fatalf("typing state mismatch: started=%d stopped=%d sent=%v", started, stopped, sent)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	targetPlatform.mu.Lock()
+	defer targetPlatform.mu.Unlock()
+	t.Fatalf("expected timeout message, got started=%d stopped=%d sent=%v", targetPlatform.started, targetPlatform.stopped, targetPlatform.sent)
 }

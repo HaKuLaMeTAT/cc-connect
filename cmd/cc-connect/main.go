@@ -26,6 +26,7 @@ import (
 	_ "github.com/chenhg5/cc-connect/agent/gemini"
 	_ "github.com/chenhg5/cc-connect/agent/iflow"
 	_ "github.com/chenhg5/cc-connect/agent/opencode"
+	_ "github.com/chenhg5/cc-connect/agent/qwen"
 	_ "github.com/chenhg5/cc-connect/agent/qoder"
 
 	_ "github.com/chenhg5/cc-connect/platform/dingtalk"

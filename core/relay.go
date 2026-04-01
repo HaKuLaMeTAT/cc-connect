@@ -13,9 +13,13 @@ import (
 )
 
 const relayTimeout = 120 * time.Second
-const geminiRelayTimeout = 5 * time.Minute
+const codexRelayTimeout = 10 * time.Minute
+const geminiRelayTimeout = 10 * time.Minute
 
 func relayTimeoutForProject(project string) time.Duration {
+	if strings.EqualFold(project, "codex") {
+		return codexRelayTimeout
+	}
 	if strings.EqualFold(project, "gemini") {
 		return geminiRelayTimeout
 	}

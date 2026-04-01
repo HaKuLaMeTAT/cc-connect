@@ -111,9 +111,9 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	slog.Info("telegram: connected", "bot", bot.Self.UserName)
 
 	// Drain pending updates from previous session to avoid re-processing old messages.
-	// offset -1 tells Telegram to mark all pending updates as confirmed, returning only the latest one.
+	// Use a short timeout to avoid hanging if there are no pending updates.
 	drain := tgbotapi.NewUpdate(-1)
-	drain.Timeout = 0
+	drain.Timeout = 1
 	if _, err := bot.GetUpdates(drain); err != nil {
 		slog.Warn("telegram: failed to drain old updates", "error", err)
 	}
@@ -141,10 +141,12 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 				}
 
 				if update.Message == nil {
+					slog.Debug("telegram: update has no message", "update", update)
 					continue
 				}
 
 				msg := update.Message
+				slog.Debug("telegram: message received", "chat_id", msg.Chat.ID, "chat_type", msg.Chat.Type, "from", msg.From.UserName, "text", msg.Text)
 				msgTime := time.Unix(int64(msg.Date), 0)
 				if core.IsOldMessage(msgTime) {
 					slog.Debug("telegram: ignoring old message after restart", "date", msgTime)
@@ -162,9 +164,10 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 				}
 				userID := strconv.FormatInt(msg.From.ID, 10)
 				if !core.AllowList(p.allowFrom, userID) {
-					slog.Debug("telegram: message from unauthorized user", "user", userID)
+					slog.Warn("telegram: message from unauthorized user", "user", userID, "allow_from", p.allowFrom)
 					continue
 				}
+				slog.Debug("telegram: user allowed", "user", userID, "allow_from", p.allowFrom)
 				storeTelegramIncomingReplyReference(msg)
 
 				isGroup := msg.Chat.Type == "group" || msg.Chat.Type == "supergroup"
@@ -173,6 +176,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 				if isGroup && !p.groupReplyAll {
 					slog.Debug("telegram: checking group message", "bot", p.bot.Self.UserName, "text", msg.Text, "is_command", msg.IsCommand())
 					if !p.isDirectedAtBot(msg) {
+						slog.Debug("telegram: ignoring group message not directed at bot", "chat", msg.Chat.ID, "bot", p.bot.Self.UserName)
 						continue
 					}
 				}
@@ -293,6 +297,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 				}
 
 				if msg.Text == "" {
+					slog.Debug("telegram: skipping message with empty text", "chat", msg.Chat.ID, "from", msg.From.UserName)
 					continue
 				}
 
@@ -312,7 +317,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 					ReplyCtx:         rctx,
 				}
 
-				slog.Debug("telegram: message received", "user", userName, "chat", msg.Chat.ID)
+				slog.Info("telegram: sending message to handler", "user", userName, "chat", msg.Chat.ID, "content_len", len(text))
 				p.handler(p, coreMsg)
 			}
 		}

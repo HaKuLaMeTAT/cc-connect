@@ -2264,8 +2264,7 @@ func (e *Engine) sendToOtherBot(sessionKey, target, content string) error {
 	if targetPlatform, replyCtx, ok := resolveEngineReplyTarget(targetEngine, platformName, sessionKey); ok {
 		slog.Info("sendto: delivering via target relay flow", "from", e.name, "to", target, "session", sessionKey)
 		go func() {
-			timeout := relayTimeoutForProject(target)
-			ctx, cancel := context.WithTimeout(e.ctx, timeout)
+			ctx, cancel := e.relayManager.relayContext(e.ctx, target)
 			defer cancel()
 
 			var stopTyping func()
@@ -2307,7 +2306,7 @@ func (e *Engine) sendToOtherBot(sessionKey, target, content string) error {
 					slog.Error("sendto: failed to send target relay response", "from", e.name, "to", target, "session", sessionKey, "error", sendErr)
 				}
 			case <-ctx.Done():
-				slog.Warn("sendto: target relay timed out", "from", e.name, "to", target, "session", sessionKey, "timeout", timeout)
+				slog.Warn("sendto: target relay timed out", "from", e.name, "to", target, "session", sessionKey, "error", ctx.Err())
 				errMsg := fmt.Sprintf(e.i18n.T(MsgError), ctx.Err())
 				if sendErr := targetPlatform.Send(context.Background(), replyCtx, errMsg); sendErr != nil {
 					slog.Error("sendto: failed to send target relay timeout", "from", e.name, "to", target, "session", sessionKey, "error", sendErr)
@@ -2323,7 +2322,7 @@ func (e *Engine) sendToOtherBot(sessionKey, target, content string) error {
 		SessionKey: sessionKey,
 		Message:    content,
 	}
-	ctx, cancel := context.WithTimeout(e.ctx, relayTimeout)
+	ctx, cancel := context.WithTimeout(e.ctx, relayTimeoutForProject(target))
 	defer cancel()
 	slog.Info("sendto: falling back to relay manager", "from", e.name, "to", target, "session", sessionKey)
 	_, err = e.relayManager.Send(ctx, req)
