@@ -272,6 +272,32 @@ func (sm *SessionManager) GetSessionName(agentSessionID string) string {
 	return sm.sessionNames[agentSessionID]
 }
 
+// KnownAgentSessionIDs returns the set of agent session IDs tracked by cc-connect.
+// It is used to filter agent.ListSessions() output to only sessions owned by
+// cc-connect, excluding sessions created outside the bridge.
+func (sm *SessionManager) KnownAgentSessionIDs() map[string]struct{} {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	ids := make(map[string]struct{})
+	for _, s := range sm.sessions {
+		s.mu.Lock()
+		agentSessionID := s.AgentSessionID
+		s.mu.Unlock()
+		if agentSessionID != "" {
+			ids[agentSessionID] = struct{}{}
+		}
+	}
+	return ids
+}
+
+// FindByID looks up a session by its internal ID.
+func (sm *SessionManager) FindByID(id string) *Session {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.sessions[id]
+}
+
 // Save persists current state to disk. Safe to call from outside (e.g. after message processing).
 func (sm *SessionManager) Save() {
 	sm.mu.RLock()

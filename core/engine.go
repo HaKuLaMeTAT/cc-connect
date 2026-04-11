@@ -2290,6 +2290,23 @@ func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
 	}
 }
 
+// filterOwnedSessions removes agent sessions that are not tracked by cc-connect's
+// session manager. This prevents external CLI sessions in the same work_dir from
+// appearing in /list, /switch, /delete, etc. If the session manager has no tracked
+// agent sessions at all (e.g. first run), all sessions are returned unfiltered.
+func filterOwnedSessions(sessions []AgentSessionInfo, known map[string]struct{}) []AgentSessionInfo {
+	if len(known) == 0 {
+		return sessions
+	}
+	filtered := make([]AgentSessionInfo, 0, len(sessions))
+	for _, s := range sessions {
+		if _, ok := known[s.ID]; ok {
+			filtered = append(filtered, s)
+		}
+	}
+	return filtered
+}
+
 const listPageSize = 20
 
 func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
@@ -2305,6 +2322,7 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgListError), err))
 			return
 		}
+		agentSessions = filterOwnedSessions(agentSessions, sessions.KnownAgentSessionIDs())
 		if len(agentSessions) == 0 {
 			agentSessions = e.fallbackListSessions(msg.SessionKey)
 		}
@@ -2437,6 +2455,7 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
 		return
 	}
+	agentSessions = filterOwnedSessions(agentSessions, sessions.KnownAgentSessionIDs())
 
 	matched := e.matchSession(agentSessions, sessions, query)
 	if matched == nil {
@@ -2599,6 +2618,7 @@ func (e *Engine) cmdSearch(p Platform, msg *Message, args []string) {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSearchError), err))
 		return
 	}
+	agentSessions = filterOwnedSessions(agentSessions, sessions.KnownAgentSessionIDs())
 
 	type searchResult struct {
 		id           string
@@ -2692,6 +2712,7 @@ func (e *Engine) cmdName(p Platform, msg *Message, args []string) {
 			e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
 			return
 		}
+		agentSessions = filterOwnedSessions(agentSessions, sessions.KnownAgentSessionIDs())
 		if idx > len(agentSessions) {
 			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoSession), idx))
 			return
@@ -5094,6 +5115,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		if err != nil || len(agentSessions) == 0 {
 			return
 		}
+		agentSessions = filterOwnedSessions(agentSessions, sessions.KnownAgentSessionIDs())
 		matched := e.matchSession(agentSessions, sessions, args)
 		if matched == nil {
 			return
@@ -5180,6 +5202,7 @@ func (e *Engine) renderDeleteModeCard(sessionKey string) *Card {
 	if err != nil {
 		return e.simpleCard(e.i18n.T(MsgDeleteModeTitle), "red", err.Error())
 	}
+	agentSessions = filterOwnedSessions(agentSessions, sessions.KnownAgentSessionIDs())
 	dm := e.getDeleteModeState(sessionKey)
 	if dm == nil {
 		return e.simpleCard(e.i18n.T(MsgDeleteModeTitle), "red", e.i18n.T(MsgDeleteUsage))
@@ -5355,7 +5378,7 @@ func (e *Engine) executeDeleteModeAction(sessionKey, args string) {
 }
 
 func (e *Engine) submitDeleteModeSelection(sessionKey string, dm *deleteModeState) []string {
-	agent, _ := e.sessionContextForKey(sessionKey)
+	agent, sessions := e.sessionContextForKey(sessionKey)
 	deleter, ok := agent.(SessionDeleter)
 	if !ok {
 		return []string{e.i18n.T(MsgDeleteNotSupported)}
@@ -5364,6 +5387,7 @@ func (e *Engine) submitDeleteModeSelection(sessionKey string, dm *deleteModeStat
 	if err != nil {
 		return []string{fmt.Sprintf("❌ %v", err)}
 	}
+	agentSessions = filterOwnedSessions(agentSessions, sessions.KnownAgentSessionIDs())
 	seen := make(map[string]struct{}, len(agentSessions))
 	lines := make([]string, 0, len(dm.selectedIDs))
 	for i := range agentSessions {
@@ -5558,6 +5582,7 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 	if err != nil {
 		return nil, fmt.Errorf(e.i18n.T(MsgListError), err)
 	}
+	agentSessions = filterOwnedSessions(agentSessions, sessions.KnownAgentSessionIDs())
 	if len(agentSessions) == 0 {
 		return e.simpleCard(e.i18n.Tf(MsgCardTitleSessions, agent.Name(), 0), "turquoise", e.i18n.T(MsgListEmpty)), nil
 	}
@@ -6851,7 +6876,7 @@ func (e *Engine) cmdAliasDel(p Platform, msg *Message, args []string) {
 }
 
 func (e *Engine) cmdDelete(p Platform, msg *Message, args []string) {
-	agent, _, _, err := e.commandContext(p, msg)
+	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
@@ -6872,6 +6897,7 @@ func (e *Engine) cmdDelete(p Platform, msg *Message, args []string) {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
 		return
 	}
+	agentSessions = filterOwnedSessions(agentSessions, sessions.KnownAgentSessionIDs())
 
 	prefix := strings.TrimSpace(args[0])
 	var matched *AgentSessionInfo

@@ -52,7 +52,12 @@ func newClaudeSession(ctx context.Context, workDir, model, sessionID, mode strin
 	if mode != "" && mode != "default" {
 		args = append(args, "--permission-mode", mode)
 	}
-	if sessionID != "" {
+	switch sessionID {
+	case "", core.ContinueSession:
+		// Truly fresh session — no resume, no continue.
+	default:
+		// Resuming a known session ID — this is cc-connect's own session
+		// from a previous connection, safe to resume directly.
 		args = append(args, "--resume", sessionID)
 	}
 	if model != "" {
