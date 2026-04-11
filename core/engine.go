@@ -807,6 +807,10 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		return
 	}
 
+	// Ensure an interactiveState entry exists before launching the async
+	// processor so messages arriving during session startup can be queued
+	// instead of dropped (issue #565).
+	e.ensureInteractiveStateForQueueing(interactiveKey, p, msg.ReplyCtx)
 	slog.Info("processing message",
 		"platform", msg.Platform,
 		"user", msg.UserName,
@@ -825,7 +829,12 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	state, hasState := e.interactiveStates[interactiveKey]
 	e.interactiveMu.Unlock()
 
-	if !hasState || state == nil || state.agentSession == nil || !state.agentSession.Alive() {
+	if !hasState || state == nil {
+		return false
+	}
+	// Allow queueing when agentSession is nil (session is starting up,
+	// issue #565). Only reject if the session was established and died.
+	if state.agentSession != nil && !state.agentSession.Alive() {
 		return false
 	}
 
@@ -860,6 +869,22 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	)
 	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
 	return true
+}
+
+// ensureInteractiveStateForQueueing creates a placeholder interactiveState
+// entry if none exists. This allows messages arriving while the agent session
+// is still starting up to be queued instead of dropped (issue #565).
+// The placeholder has agentSession==nil; getOrCreateInteractiveStateWith will
+// replace it with a fully initialized state once the agent process is spawned.
+func (e *Engine) ensureInteractiveStateForQueueing(key string, p Platform, replyCtx any) {
+	e.interactiveMu.Lock()
+	defer e.interactiveMu.Unlock()
+	if _, ok := e.interactiveStates[key]; !ok {
+		e.interactiveStates[key] = &interactiveState{
+			platform: p,
+			replyCtx: replyCtx,
+		}
+	}
 }
 
 // drainOrphanedQueue is called when a message was queued but the drain loop
@@ -1301,9 +1326,19 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 
 	// Preserve quiet setting from existing state (e.g. set via /quiet before session started)
 	quietMode := e.defaultQuiet
+	approveAll := false
+	workspaceDir := ""
+	var deleteMode *deleteModeState
+	var pendingMessages []queuedMessage
 	if ok && state != nil {
 		state.mu.Lock()
 		quietMode = state.quiet
+		approveAll = state.approveAll
+		workspaceDir = state.workspaceDir
+		deleteMode = state.deleteMode
+		if len(state.pendingMessages) > 0 {
+			pendingMessages = append([]queuedMessage(nil), state.pendingMessages...)
+		}
 		state.mu.Unlock()
 	}
 
@@ -1333,7 +1368,15 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	// Check if context is already canceled (e.g. during shutdown/restart)
 	if e.ctx.Err() != nil {
 		slog.Debug("skipping session start: context canceled", "session_key", sessionKey)
-		state = &interactiveState{platform: p, replyCtx: replyCtx, quiet: quietMode}
+		state = &interactiveState{
+			platform:        p,
+			replyCtx:        replyCtx,
+			workspaceDir:    workspaceDir,
+			pendingMessages: pendingMessages,
+			approveAll:      approveAll,
+			quiet:           quietMode,
+			deleteMode:      deleteMode,
+		}
 		e.interactiveStates[sessionKey] = state
 		return state
 	}
@@ -1344,7 +1387,15 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	startElapsed := time.Since(startAt)
 	if err != nil {
 		slog.Error("failed to start interactive session", "error", err, "elapsed", startElapsed)
-		state = &interactiveState{platform: p, replyCtx: replyCtx, quiet: quietMode}
+		state = &interactiveState{
+			platform:        p,
+			replyCtx:        replyCtx,
+			workspaceDir:    workspaceDir,
+			pendingMessages: pendingMessages,
+			approveAll:      approveAll,
+			quiet:           quietMode,
+			deleteMode:      deleteMode,
+		}
 		e.interactiveStates[sessionKey] = state
 		return state
 	}
@@ -1358,10 +1409,14 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	}
 
 	state = &interactiveState{
-		agentSession: agentSession,
-		platform:     p,
-		replyCtx:     replyCtx,
-		quiet:        quietMode,
+		agentSession:    agentSession,
+		platform:        p,
+		replyCtx:        replyCtx,
+		workspaceDir:    workspaceDir,
+		pendingMessages: pendingMessages,
+		approveAll:      approveAll,
+		quiet:           quietMode,
+		deleteMode:      deleteMode,
 	}
 	e.interactiveStates[sessionKey] = state
 

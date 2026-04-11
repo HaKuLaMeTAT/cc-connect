@@ -2027,3 +2027,120 @@ func TestExecuteCardAction_ModeCleansUpWithInteractiveKey(t *testing.T) {
 		t.Error("expected interactive state to be cleaned up after /mode")
 	}
 }
+
+func TestEnsureInteractiveStateForQueueing_CreatesPlaceholder(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := newTestEngine()
+
+	key := "test:startup-user"
+	e.ensureInteractiveStateForQueueing(key, p, "ctx-startup")
+
+	e.interactiveMu.Lock()
+	state, ok := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+	if !ok || state == nil {
+		t.Fatal("expected placeholder interactive state to be created")
+	}
+	if state.agentSession != nil {
+		t.Fatal("expected placeholder state to have nil agentSession")
+	}
+	if state.platform != p || state.replyCtx != "ctx-startup" {
+		t.Fatalf("unexpected placeholder state: %+v", state)
+	}
+}
+
+func TestQueueMessage_NoState_ReturnsFalse(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := newTestEngine()
+
+	msg := &Message{SessionKey: "nonexistent:key", Content: "hello"}
+	if ok := e.queueMessageForBusySession(p, msg, "nonexistent:key"); ok {
+		t.Fatal("expected false when no interactive state exists")
+	}
+}
+
+func TestQueueMessage_DeadSession_ReturnsFalse(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("dead")
+	sess.alive = false
+	agent := &queueTestAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:dead-session"
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{
+		agentSession: sess,
+		platform:     p,
+	}
+	e.interactiveMu.Unlock()
+
+	msg := &Message{SessionKey: key, Content: "hello"}
+	if ok := e.queueMessageForBusySession(p, msg, key); ok {
+		t.Fatal("expected false for dead session")
+	}
+}
+
+func TestQueueMessage_NilAgentSession_DuringStartup(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := newTestEngine()
+
+	key := "test:starting-session"
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{
+		platform: p,
+		replyCtx: "ctx",
+	}
+	e.interactiveMu.Unlock()
+
+	msg := &Message{SessionKey: key, Content: "queued during startup", ReplyCtx: "ctx-startup"}
+	if ok := e.queueMessageForBusySession(p, msg, key); !ok {
+		t.Fatal("expected true: messages should be queueable during session startup")
+	}
+
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.pendingMessages) != 1 {
+		t.Fatalf("pendingMessages len = %d, want 1", len(state.pendingMessages))
+	}
+	if got := state.pendingMessages[0].content; got != "queued during startup" {
+		t.Fatalf("queued content = %q, want %q", got, "queued during startup")
+	}
+}
+
+func TestGetOrCreateInteractiveStateWith_PreservesQueuedMessagesDuringStartup(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("qs-startup")
+	agent := &queueTestAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:startup-preserve"
+	session := e.sessions.GetOrCreateActive(key)
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{
+		platform:        p,
+		replyCtx:        "ctx-startup",
+		pendingMessages: []queuedMessage{{platform: p, replyCtx: "ctx-queued", content: "queued before start"}},
+		quiet:           true,
+	}
+	e.interactiveMu.Unlock()
+
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx-active", session, e.sessions, nil)
+	if state == nil || state.agentSession == nil {
+		t.Fatal("expected interactive state to have a started agent session")
+	}
+	if !state.quiet {
+		t.Fatal("expected quiet mode to be preserved from placeholder state")
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.pendingMessages) != 1 {
+		t.Fatalf("pendingMessages len = %d, want 1", len(state.pendingMessages))
+	}
+	if got := state.pendingMessages[0].content; got != "queued before start" {
+		t.Fatalf("queued content = %q, want %q", got, "queued before start")
+	}
+}
