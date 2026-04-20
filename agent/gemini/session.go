@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -272,22 +273,20 @@ func (gs *geminiSession) Send(prompt string, images []core.ImageAttachment) erro
 }
 
 func (gs *geminiSession) readLoop(stdout io.ReadCloser) bool {
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	sawTerminal := false
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
+	if err := readGeminiJSONLines(stdout, func(line []byte) error {
+		lineText := string(line)
+		if lineText == "" {
+			return nil
 		}
 
-		slog.Debug("geminiSession: raw", "line", truncate(line, 500))
+		slog.Debug("geminiSession: raw", "line", truncate(lineText, 500))
 
 		var raw map[string]any
-		if err := json.Unmarshal([]byte(line), &raw); err != nil {
-			slog.Debug("geminiSession: non-JSON line", "line", line)
-			continue
+		if err := json.Unmarshal(line, &raw); err != nil {
+			slog.Debug("geminiSession: non-JSON line", "line", lineText)
+			return nil
 		}
 
 		switch raw["type"] {
@@ -295,10 +294,9 @@ func (gs *geminiSession) readLoop(stdout io.ReadCloser) bool {
 			sawTerminal = true
 		}
 		gs.handleEvent(raw)
-	}
-
-	if err := scanner.Err(); err != nil && gs.ctx.Err() == nil {
-		slog.Error("geminiSession: scanner error", "error", err)
+		return nil
+	}); err != nil && gs.ctx.Err() == nil {
+		slog.Error("geminiSession: read stdout error", "error", err)
 		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}
 		select {
 		case gs.events <- evt:
@@ -307,6 +305,31 @@ func (gs *geminiSession) readLoop(stdout io.ReadCloser) bool {
 		sawTerminal = true
 	}
 	return sawTerminal
+}
+
+func readGeminiJSONLines(r io.Reader, handle func([]byte) error) error {
+	reader := bufio.NewReader(r)
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if errors.Is(err, io.EOF) && len(line) == 0 {
+			return nil
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+
+		line = bytes.TrimRight(line, "\r\n")
+		if len(line) > 0 {
+			if err := handle(line); err != nil {
+				return err
+			}
+		}
+
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+	}
 }
 
 // Gemini CLI stream-json event types:

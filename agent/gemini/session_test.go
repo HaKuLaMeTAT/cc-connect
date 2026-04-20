@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,5 +106,84 @@ func TestGeminiSession_ContinueSessionTreatedAsFresh(t *testing.T) {
 
 	if got := s.CurrentSessionID(); got != "" {
 		t.Errorf("ContinueSession should be treated as fresh: chatID = %q, want empty", got)
+	}
+}
+
+func TestGeminiSessionSend_AllowsLongJSONLines(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	outputPath := filepath.Join(tmpDir, "stdout.jsonl")
+	scriptPath := filepath.Join(tmpDir, "fake-gemini.sh")
+	script := `#!/bin/sh
+set -eu
+cat "$FAKE_GEMINI_STDOUT"
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gemini script: %v", err)
+	}
+
+	longContent := strings.Repeat("x", 2*1024*1024)
+	messageLine, err := json.Marshal(map[string]any{
+		"type":    "message",
+		"role":    "assistant",
+		"content": longContent,
+	})
+	if err != nil {
+		t.Fatalf("marshal message line: %v", err)
+	}
+	resultLine, err := json.Marshal(map[string]any{
+		"type":   "result",
+		"status": "success",
+	})
+	if err != nil {
+		t.Fatalf("marshal result line: %v", err)
+	}
+	stream := append(messageLine, '\n')
+	stream = append(stream, resultLine...)
+	stream = append(stream, '\n')
+	if err := os.WriteFile(outputPath, stream, 0o644); err != nil {
+		t.Fatalf("write stdout jsonl: %v", err)
+	}
+
+	gs, err := newGeminiSession(
+		context.Background(),
+		scriptPath,
+		tmpDir,
+		"fake-model",
+		"default",
+		"",
+		[]string{"FAKE_GEMINI_STDOUT=" + outputPath},
+		2*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("newGeminiSession: %v", err)
+	}
+	defer gs.Close()
+
+	if err := gs.Send("hello", nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	deadline := time.After(3 * time.Second)
+	sawLongContent := false
+	for {
+		select {
+		case evt := <-gs.Events():
+			if evt.Type == core.EventError {
+				t.Fatalf("unexpected EventError: %v", evt.Error)
+			}
+			if evt.Type == core.EventText && evt.Content == longContent {
+				sawLongContent = true
+			}
+			if evt.Type == core.EventResult {
+				if !sawLongContent {
+					t.Fatal("did not receive long Gemini message before result")
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for Gemini long-line response")
+		}
 	}
 }
