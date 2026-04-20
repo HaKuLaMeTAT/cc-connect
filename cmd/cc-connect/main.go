@@ -248,11 +248,19 @@ func main() {
 		// Wire display truncation settings
 		{
 			dcfg := core.DisplayCfg{
-				ThinkingMaxLen: 300,
-				ToolMaxLen:     500,
+				ThinkingMessages: true,
+				ThinkingMaxLen:   300,
+				ToolMessages:     true,
+				ToolMaxLen:       500,
+			}
+			if cfg.Display.ThinkingMessages != nil {
+				dcfg.ThinkingMessages = *cfg.Display.ThinkingMessages
 			}
 			if cfg.Display.ThinkingMaxLen != nil {
 				dcfg.ThinkingMaxLen = *cfg.Display.ThinkingMaxLen
+			}
+			if cfg.Display.ToolMessages != nil {
+				dcfg.ToolMessages = *cfg.Display.ToolMessages
 			}
 			if cfg.Display.ToolMaxLen != nil {
 				dcfg.ToolMaxLen = *cfg.Display.ToolMaxLen
@@ -300,6 +308,9 @@ func main() {
 		}
 		engine.SetDisplaySaveFunc(func(thinkingMaxLen, toolMaxLen *int) error {
 			return config.SaveDisplayConfig(thinkingMaxLen, toolMaxLen)
+		})
+		engine.SetDisplayMessageSaveFunc(func(thinkingMessages, toolMessages *bool) error {
+			return config.SaveDisplayMessages(thinkingMessages, toolMessages)
 		})
 
 		// Wire idle timeout
@@ -778,9 +789,15 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	}
 
 	// Reload display config
-	dcfg := core.DisplayCfg{ThinkingMaxLen: 300, ToolMaxLen: 500}
+	dcfg := core.DisplayCfg{ThinkingMessages: true, ThinkingMaxLen: 300, ToolMessages: true, ToolMaxLen: 500}
+	if cfg.Display.ThinkingMessages != nil {
+		dcfg.ThinkingMessages = *cfg.Display.ThinkingMessages
+	}
 	if cfg.Display.ThinkingMaxLen != nil {
 		dcfg.ThinkingMaxLen = *cfg.Display.ThinkingMaxLen
+	}
+	if cfg.Display.ToolMessages != nil {
+		dcfg.ToolMessages = *cfg.Display.ToolMessages
 	}
 	if cfg.Display.ToolMaxLen != nil {
 		dcfg.ToolMaxLen = *cfg.Display.ToolMaxLen

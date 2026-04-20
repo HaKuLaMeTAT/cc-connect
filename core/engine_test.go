@@ -1493,11 +1493,69 @@ func TestCmdConfig_UsesLegacyTextOnPlatformWithoutCardSupport(t *testing.T) {
 	if len(p.sent) != 1 {
 		t.Fatalf("sent messages = %d, want 1", len(p.sent))
 	}
+	if !strings.Contains(p.sent[0], "thinking_messages") || !strings.Contains(p.sent[0], "tool_messages") {
+		t.Fatalf("config text = %q, want display message toggle items", p.sent[0])
+	}
 	if !strings.Contains(p.sent[0], "thinking_max_len") {
 		t.Fatalf("config text = %q, want legacy config list", p.sent[0])
 	}
 	if strings.Contains(p.sent[0], "[← Back]") {
 		t.Fatalf("config text = %q, should not be card fallback text", p.sent[0])
+	}
+}
+
+func TestConfigItems_DisplayMessageToggles(t *testing.T) {
+	e := newTestEngine()
+
+	var savedThinking *bool
+	var savedTool *bool
+	e.SetDisplayMessageSaveFunc(func(thinkingMessages, toolMessages *bool) error {
+		savedThinking = thinkingMessages
+		savedTool = toolMessages
+		return nil
+	})
+
+	items := e.configItems()
+	var thinkingItem *configItem
+	var toolItem *configItem
+	for i := range items {
+		switch items[i].key {
+		case "thinking_messages":
+			thinkingItem = &items[i]
+		case "tool_messages":
+			toolItem = &items[i]
+		}
+	}
+	if thinkingItem == nil || toolItem == nil {
+		t.Fatalf("missing display toggle items: thinking=%v tool=%v", thinkingItem != nil, toolItem != nil)
+	}
+
+	if err := thinkingItem.setFunc("false"); err != nil {
+		t.Fatalf("set thinking_messages: %v", err)
+	}
+	if e.display.ThinkingMessages {
+		t.Fatal("expected thinking messages to be disabled")
+	}
+	if savedThinking == nil || *savedThinking {
+		t.Fatalf("savedThinking = %v, want false", savedThinking)
+	}
+	if savedTool != nil {
+		t.Fatalf("savedTool = %v, want nil", savedTool)
+	}
+
+	savedThinking = nil
+	savedTool = nil
+	if err := toolItem.setFunc("false"); err != nil {
+		t.Fatalf("set tool_messages: %v", err)
+	}
+	if e.display.ToolMessages {
+		t.Fatal("expected tool messages to be disabled")
+	}
+	if savedTool == nil || *savedTool {
+		t.Fatalf("savedTool = %v, want false", savedTool)
+	}
+	if savedThinking != nil {
+		t.Fatalf("savedThinking = %v, want nil", savedThinking)
 	}
 }
 
@@ -1770,6 +1828,130 @@ func TestDrainEventsOpenChannel(t *testing.T) {
 	case <-ch:
 		t.Fatal("expected channel to be drained")
 	default:
+	}
+}
+
+func TestProcessInteractiveEvents_ThinkingMessagesDisabledSuppressesThinkingOnly(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{
+		ThinkingMessages: false,
+		ThinkingMaxLen:   300,
+		ToolMessages:     true,
+		ToolMaxLen:       500,
+	})
+
+	sessionKey := "test:user-thinking"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	sess := newQueuingSession("thinking-disabled")
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[sessionKey] = state
+	e.interactiveMu.Unlock()
+
+	sess.events <- Event{Type: EventThinking, Content: "planning"}
+	sess.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo hi"}
+	sess.events <- Event{Type: EventResult, Content: "done", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "msg-thinking", time.Now(), nil)
+
+	if len(p.sent) != 2 {
+		t.Fatalf("sent = %#v, want tool message and final response", p.sent)
+	}
+	for _, msg := range p.sent {
+		if strings.Contains(msg, "planning") {
+			t.Fatalf("unexpected thinking output when disabled: %q", msg)
+		}
+	}
+	if !strings.Contains(p.sent[0], "Tool #1") || !strings.Contains(p.sent[0], "echo hi") {
+		t.Fatalf("tool message = %q, want visible tool progress", p.sent[0])
+	}
+	if p.sent[1] != "done" {
+		t.Fatalf("final message = %q, want done", p.sent[1])
+	}
+}
+
+func TestProcessInteractiveEvents_ToolMessagesEnabledShowsToolResult(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{
+		ThinkingMessages: true,
+		ThinkingMaxLen:   300,
+		ToolMessages:     true,
+		ToolMaxLen:       500,
+	})
+
+	sessionKey := "test:user-tool-result"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	sess := newQueuingSession("tool-result")
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[sessionKey] = state
+	e.interactiveMu.Unlock()
+
+	sess.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo hi"}
+	sess.events <- Event{Type: EventToolResult, ToolName: "Bash", ToolResult: "hi"}
+	sess.events <- Event{Type: EventResult, Content: "done", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "msg-tool-result", time.Now(), nil)
+
+	if len(p.sent) != 3 {
+		t.Fatalf("sent = %#v, want tool use, tool result, and final response", p.sent)
+	}
+	if !strings.Contains(p.sent[1], "Tool Result: Bash") || !strings.Contains(p.sent[1], "hi") {
+		t.Fatalf("tool result message = %q, want formatted tool result", p.sent[1])
+	}
+	if p.sent[2] != "done" {
+		t.Fatalf("final message = %q, want done", p.sent[2])
+	}
+}
+
+func TestProcessInteractiveEvents_ToolMessagesDisabledUsesAccumulatedText(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{
+		ThinkingMessages: true,
+		ThinkingMaxLen:   300,
+		ToolMessages:     false,
+		ToolMaxLen:       500,
+	})
+
+	sessionKey := "test:user-hidden-tool"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	sess := newQueuingSession("hidden-tool")
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[sessionKey] = state
+	e.interactiveMu.Unlock()
+
+	sess.events <- Event{Type: EventText, Content: "First part."}
+	sess.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "ls"}
+	sess.events <- Event{Type: EventToolResult, ToolName: "Bash", ToolResult: "file.go"}
+	sess.events <- Event{Type: EventText, Content: "Second part."}
+	sess.events <- Event{Type: EventToolUse, ToolName: "Read", ToolInput: "file.go"}
+	sess.events <- Event{Type: EventToolResult, ToolName: "Read", ToolResult: "package main"}
+	sess.events <- Event{Type: EventText, Content: "Third part."}
+	sess.events <- Event{Type: EventResult, Content: "Third part.", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "msg-hidden-tool", time.Now(), nil)
+
+	if len(p.sent) != 1 {
+		t.Fatalf("sent = %#v, want only final response", p.sent)
+	}
+	if got, want := p.sent[0], "First part.\n\nSecond part.\n\nThird part."; got != want {
+		t.Fatalf("final message = %q, want %q", got, want)
 	}
 }
 

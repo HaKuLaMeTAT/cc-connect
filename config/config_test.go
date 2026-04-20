@@ -99,6 +99,61 @@ type = "telegram"
 	}
 }
 
+func TestSaveDisplaySettings(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	content := `[[projects]]
+name = "demo"
+
+[projects.agent]
+type = "codex"
+
+[projects.agent.options]
+work_dir = "/tmp/demo"
+
+[[projects.platforms]]
+type = "telegram"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	prevPath := ConfigPath
+	ConfigPath = path
+	defer func() {
+		ConfigPath = prevPath
+	}()
+
+	thinkingMessages := false
+	toolMessages := false
+	thinkingMaxLen := 120
+	toolMaxLen := 240
+
+	if err := SaveDisplayMessages(&thinkingMessages, &toolMessages); err != nil {
+		t.Fatalf("SaveDisplayMessages: %v", err)
+	}
+	if err := SaveDisplayConfig(&thinkingMaxLen, &toolMaxLen); err != nil {
+		t.Fatalf("SaveDisplayConfig: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Display.ThinkingMessages == nil || *cfg.Display.ThinkingMessages {
+		t.Fatalf("thinking_messages = %v, want false", cfg.Display.ThinkingMessages)
+	}
+	if cfg.Display.ToolMessages == nil || *cfg.Display.ToolMessages {
+		t.Fatalf("tool_messages = %v, want false", cfg.Display.ToolMessages)
+	}
+	if cfg.Display.ThinkingMaxLen == nil || *cfg.Display.ThinkingMaxLen != 120 {
+		t.Fatalf("thinking_max_len = %v, want 120", cfg.Display.ThinkingMaxLen)
+	}
+	if cfg.Display.ToolMaxLen == nil || *cfg.Display.ToolMaxLen != 240 {
+		t.Fatalf("tool_max_len = %v, want 240", cfg.Display.ToolMaxLen)
+	}
+}
+
 func TestLoadRelayTimeoutConfig(t *testing.T) {
 	configPath := writeConfigFixture(t, relayConfigFixture)
 

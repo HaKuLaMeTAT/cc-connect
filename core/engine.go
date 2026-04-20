@@ -106,11 +106,13 @@ func (e *Engine) SendRestartNotification(platformName, sessionKey string) {
 // to perform a graceful shutdown followed by syscall.Exec.
 var RestartCh = make(chan RestartRequest, 1)
 
-// DisplayCfg controls truncation of intermediate messages.
+// DisplayCfg controls how intermediate messages are shown.
 // A value of -1 means "use default", 0 means "no truncation".
 type DisplayCfg struct {
-	ThinkingMaxLen int // max runes for thinking preview; 0 = no truncation
-	ToolMaxLen     int // max runes for tool use preview; 0 = no truncation
+	ThinkingMessages bool // whether to show thinking messages
+	ThinkingMaxLen   int  // max runes for thinking preview; 0 = no truncation
+	ToolMessages     bool // whether to show tool progress/result messages
+	ToolMaxLen       int  // max runes for tool use preview; 0 = no truncation
 }
 
 // RateLimitCfg controls per-session message rate limiting.
@@ -147,8 +149,9 @@ type Engine struct {
 	commandSaveAddFunc func(name, description, prompt, exec, workDir string) error
 	commandSaveDelFunc func(name string) error
 
-	displaySaveFunc  func(thinkingMaxLen, toolMaxLen *int) error
-	configReloadFunc func() (*ConfigReloadResult, error)
+	displaySaveFunc        func(thinkingMaxLen, toolMaxLen *int) error
+	displayMessageSaveFunc func(thinkingMessages, toolMessages *bool) error
+	configReloadFunc       func() (*ConfigReloadResult, error)
 
 	cronScheduler *CronScheduler
 
@@ -296,7 +299,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		ctx:               ctx,
 		cancel:            cancel,
 		i18n:              NewI18n(lang),
-		display:           DisplayCfg{ThinkingMaxLen: defaultThinkingMaxLen, ToolMaxLen: defaultToolMaxLen},
+		display:           DisplayCfg{ThinkingMessages: true, ThinkingMaxLen: defaultThinkingMaxLen, ToolMessages: true, ToolMaxLen: defaultToolMaxLen},
 		commands:          NewCommandRegistry(),
 		skills:            NewSkillRegistry(),
 		aliases:           make(map[string]string),
@@ -383,7 +386,7 @@ func (e *Engine) SetGlobalQuietSaveFunc(fn func(quiet bool) error) {
 	e.globalQuietSaveFunc = fn
 }
 
-// SetDisplayConfig overrides the default truncation settings.
+// SetDisplayConfig overrides the default display settings.
 func (e *Engine) SetDisplayConfig(cfg DisplayCfg) {
 	e.display = cfg
 }
@@ -423,6 +426,10 @@ func (e *Engine) SetCommandSaveDelFunc(fn func(name string) error) {
 
 func (e *Engine) SetDisplaySaveFunc(fn func(thinkingMaxLen, toolMaxLen *int) error) {
 	e.displaySaveFunc = fn
+}
+
+func (e *Engine) SetDisplayMessageSaveFunc(fn func(thinkingMessages, toolMessages *bool) error) {
+	e.displayMessageSaveFunc = fn
 }
 
 // ConfigReloadResult describes what was updated by a config reload.
@@ -1504,6 +1511,7 @@ const defaultEventIdleTimeout = 2 * time.Hour
 func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func()) {
 	var textParts []string
 	toolCount := 0
+	pendingHiddenToolBreak := false
 	waitStart := time.Now()
 	firstEventLogged := false
 
@@ -1595,7 +1603,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		switch event.Type {
 		case EventThinking:
-			if !quiet && event.Content != "" {
+			if !quiet && e.display.ThinkingMessages && event.Content != "" {
 				sp.freeze()
 				preview := truncateIf(event.Content, e.display.ThinkingMaxLen)
 				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgThinking), preview))
@@ -1603,7 +1611,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		case EventToolUse:
 			toolCount++
-			if !quiet {
+			if !quiet && !e.display.ToolMessages && len(textParts) > 0 {
+				pendingHiddenToolBreak = true
+			}
+			if !quiet && e.display.ToolMessages {
 				sp.freeze()
 				inputPreview := truncateIf(event.ToolInput, e.display.ToolMaxLen)
 				// Use code block if content is long (>5 lines or >200 chars), otherwise inline code
@@ -1617,8 +1628,39 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgTool), toolCount, event.ToolName, formattedInput))
 			}
 
+		case EventToolResult:
+			if !quiet && e.display.ToolMessages {
+				sp.freeze()
+				resultPreview := strings.TrimSpace(event.ToolResult)
+				if resultPreview == "" {
+					resultPreview = strings.TrimSpace(event.Content)
+				}
+				if resultPreview == "" {
+					break
+				}
+				resultPreview = truncateIf(resultPreview, e.display.ToolMaxLen)
+				var formattedResult string
+				if strings.Contains(resultPreview, "\n") || utf8.RuneCountInString(resultPreview) > 200 {
+					formattedResult = fmt.Sprintf("```\n%s\n```", resultPreview)
+				} else {
+					formattedResult = fmt.Sprintf("`%s`", resultPreview)
+				}
+				toolName := event.ToolName
+				if toolName == "" {
+					toolName = "tool"
+				}
+				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgToolResult), toolName, formattedResult))
+			}
+
 		case EventText:
 			if event.Content != "" {
+				if pendingHiddenToolBreak && len(textParts) > 0 {
+					textParts = append(textParts, "\n\n")
+					if sp.canPreview() {
+						sp.appendText("\n\n")
+					}
+				}
+				pendingHiddenToolBreak = false
 				textParts = append(textParts, event.Content)
 				if sp.canPreview() {
 					sp.appendText(event.Content)
@@ -1695,8 +1737,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 			fullResponse := event.Content
-			if fullResponse == "" && len(textParts) > 0 {
-				fullResponse = strings.Join(textParts, "")
+			if len(textParts) > 0 {
+				accumulated := strings.Join(textParts, "")
+				if len(accumulated) > len(fullResponse) {
+					fullResponse = accumulated
+				}
 			}
 			if fullResponse == "" {
 				fullResponse = e.i18n.T(MsgEmptyResponse)
@@ -6540,6 +6585,25 @@ func (ci configItem) description(isZh bool) string {
 func (e *Engine) configItems() []configItem {
 	return []configItem{
 		{
+			key:    "thinking_messages",
+			desc:   "Whether thinking messages are shown (true/false)",
+			descZh: "是否显示思考消息 (true/false)",
+			getFunc: func() string {
+				return fmt.Sprintf("%t", e.display.ThinkingMessages)
+			},
+			setFunc: func(v string) error {
+				b, err := strconv.ParseBool(v)
+				if err != nil {
+					return fmt.Errorf("invalid boolean: %s", v)
+				}
+				e.display.ThinkingMessages = b
+				if e.displayMessageSaveFunc != nil {
+					return e.displayMessageSaveFunc(&b, nil)
+				}
+				return nil
+			},
+		},
+		{
 			key:    "thinking_max_len",
 			desc:   "Max chars for thinking messages (0=no truncation)",
 			descZh: "思考消息最大长度 (0=不截断)",
@@ -6557,6 +6621,25 @@ func (e *Engine) configItems() []configItem {
 				e.display.ThinkingMaxLen = n
 				if e.displaySaveFunc != nil {
 					return e.displaySaveFunc(&n, nil)
+				}
+				return nil
+			},
+		},
+		{
+			key:    "tool_messages",
+			desc:   "Whether tool progress messages are shown (true/false)",
+			descZh: "是否显示工具进度消息 (true/false)",
+			getFunc: func() string {
+				return fmt.Sprintf("%t", e.display.ToolMessages)
+			},
+			setFunc: func(v string) error {
+				b, err := strconv.ParseBool(v)
+				if err != nil {
+					return fmt.Errorf("invalid boolean: %s", v)
+				}
+				e.display.ToolMessages = b
+				if e.displayMessageSaveFunc != nil {
+					return e.displayMessageSaveFunc(nil, &b)
 				}
 				return nil
 			},

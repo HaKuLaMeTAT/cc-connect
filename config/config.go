@@ -41,8 +41,10 @@ type CronConfig struct {
 
 // DisplayConfig controls how intermediate messages (thinking, tool output) are shown.
 type DisplayConfig struct {
-	ThinkingMaxLen *int `toml:"thinking_max_len"` // max chars for thinking messages; 0 = no truncation; default 300
-	ToolMaxLen     *int `toml:"tool_max_len"`     // max chars for tool use messages; 0 = no truncation; default 500
+	ThinkingMessages *bool `toml:"thinking_messages"` // whether thinking messages are shown; default true
+	ThinkingMaxLen   *int  `toml:"thinking_max_len"`  // max chars for thinking messages; 0 = no truncation; default 300
+	ToolMessages     *bool `toml:"tool_messages"`     // whether tool progress messages are shown; default true
+	ToolMaxLen       *int  `toml:"tool_max_len"`      // max chars for tool use messages; 0 = no truncation; default 500
 }
 
 // StreamPreviewConfig controls real-time streaming preview in IM.
@@ -510,6 +512,30 @@ func SaveDisplayConfig(thinkingMaxLen, toolMaxLen *int) error {
 	}
 	if toolMaxLen != nil {
 		cfg.Display.ToolMaxLen = toolMaxLen
+	}
+	return saveConfig(cfg)
+}
+
+// SaveDisplayMessages persists the display message visibility settings to the config file.
+func SaveDisplayMessages(thinkingMessages, toolMessages *bool) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return fmt.Errorf("config path not set")
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	if thinkingMessages != nil {
+		cfg.Display.ThinkingMessages = thinkingMessages
+	}
+	if toolMessages != nil {
+		cfg.Display.ToolMessages = toolMessages
 	}
 	return saveConfig(cfg)
 }
