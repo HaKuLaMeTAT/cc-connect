@@ -1240,6 +1240,9 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 
 // getOrCreateWorkspaceAgent returns (or creates) a per-workspace agent and session manager.
 func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionManager, error) {
+	if e.workspacePool == nil {
+		return nil, nil, fmt.Errorf("workspace pool not initialized (multi-workspace mode not enabled)")
+	}
 	ws := e.workspacePool.GetOrCreate(workspace)
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
