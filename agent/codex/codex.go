@@ -32,6 +32,9 @@ type Agent struct {
 	model           string
 	reasoningEffort string
 	mode            string // "suggest" | "auto-edit" | "full-auto" | "yolo"
+	backend         string // "exec" | "app_server"
+	appServerURL    string
+	codexHome       string
 	providers       []core.ProviderConfig
 	activeIdx       int // -1 = no provider set
 	sessionEnv      []string
@@ -46,7 +49,17 @@ func New(opts map[string]any) (core.Agent, error) {
 	model, _ := opts["model"].(string)
 	reasoningEffort, _ := opts["reasoning_effort"].(string)
 	mode, _ := opts["mode"].(string)
+	backend, _ := opts["backend"].(string)
+	appServerURL, _ := opts["app_server_url"].(string)
+	codexHome, _ := opts["codex_home"].(string)
 	mode = normalizeMode(mode)
+	backend = normalizeBackend(backend)
+
+	if appServerURL == "" {
+		appServerURL = "ws://127.0.0.1:3845"
+	} else if strings.EqualFold(strings.TrimSpace(appServerURL), "stdio") {
+		appServerURL = ""
+	}
 
 	if _, err := exec.LookPath("codex"); err != nil {
 		return nil, fmt.Errorf("codex: 'codex' CLI not found in PATH, install with: npm install -g @openai/codex")
@@ -57,8 +70,20 @@ func New(opts map[string]any) (core.Agent, error) {
 		model:           model,
 		reasoningEffort: normalizeReasoningEffort(reasoningEffort),
 		mode:            mode,
+		backend:         backend,
+		appServerURL:    appServerURL,
+		codexHome:       strings.TrimSpace(codexHome),
 		activeIdx:       -1,
 	}, nil
+}
+
+func normalizeBackend(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "app-server", "app_server", "appserver", "ws":
+		return "app_server"
+	default:
+		return "exec"
+	}
 }
 
 func normalizeMode(raw string) string {
@@ -137,6 +162,7 @@ func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 
 func defaultCodexModels() []core.ModelOption {
 	return []core.ModelOption{
+		{Name: "gpt-5.5", Desc: "GPT-5.5"},
 		{Name: "gpt-5.4", Desc: "GPT-5.4"},
 		{Name: "gpt-5.3-codex", Desc: "GPT-5.3 Codex"},
 		{Name: "gpt-5.2-codex", Desc: "GPT-5.2 Codex"},
@@ -317,32 +343,59 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	mode := a.mode
 	model := a.model
 	reasoningEffort := a.reasoningEffort
+	backend := a.backend
+	appServerURL := a.appServerURL
+	codexHome := a.codexHome
 	extraEnv := a.providerEnvLocked()
 	extraEnv = append(extraEnv, a.sessionEnv...)
+	baseURL := ""
+	provName := ""
 	if a.activeIdx >= 0 && a.activeIdx < len(a.providers) {
+		prov := a.providers[a.activeIdx]
 		if m := a.providers[a.activeIdx].Model; m != "" {
 			model = m
 		}
+		baseURL = prov.BaseURL
+		provName = prov.Name
 	}
 	a.mu.Unlock()
 
+	if backend == "app_server" {
+		return newAppServerSession(ctx, appServerURL, a.workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome)
+	}
+	if codexHome != "" {
+		extraEnv = append(extraEnv, "CODEX_HOME="+codexHome)
+	}
 	return newCodexSession(ctx, a.workDir, model, reasoningEffort, mode, sessionID, extraEnv)
 }
 
 func (a *Agent) GetContextUsage(_ context.Context, sessionID string) (*core.ContextUsage, error) {
-	return getCodexContextUsage(sessionID)
+	a.mu.Lock()
+	codexHome := a.codexHome
+	a.mu.Unlock()
+	return getCodexContextUsageInHome(sessionID, codexHome)
 }
 
 func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
-	return listCodexSessions(a.workDir)
+	a.mu.Lock()
+	codexHome := a.codexHome
+	workDir := a.workDir
+	a.mu.Unlock()
+	return listCodexSessions(workDir, codexHome)
 }
 
 func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int) ([]core.HistoryEntry, error) {
-	return getSessionHistory(sessionID, limit)
+	a.mu.Lock()
+	codexHome := a.codexHome
+	a.mu.Unlock()
+	return getSessionHistory(sessionID, codexHome, limit)
 }
 
 func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
-	path := findSessionFile(sessionID)
+	a.mu.Lock()
+	codexHome := a.codexHome
+	a.mu.Unlock()
+	path := findSessionFile(sessionID, codexHome)
 	if path == "" {
 		return fmt.Errorf("session file not found: %s", sessionID)
 	}

@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,10 +26,9 @@ func TestPatchSessionSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Override CODEX_HOME for test
-	t.Setenv("CODEX_HOME", filepath.Join(tmpDir, ".codex"))
+	codexHome := filepath.Join(tmpDir, ".codex")
 
-	patchSessionSource(sessionID)
+	patchSessionSource(sessionID, codexHome)
 
 	data, err := os.ReadFile(fname)
 	if err != nil {
@@ -65,9 +65,9 @@ func TestPatchSessionSource_Idempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Setenv("CODEX_HOME", filepath.Join(tmpDir, ".codex"))
+	codexHome := filepath.Join(tmpDir, ".codex")
 
-	patchSessionSource(sessionID)
+	patchSessionSource(sessionID, codexHome)
 
 	data, _ := os.ReadFile(fname)
 	if string(data) != line1+"\n" {
@@ -88,9 +88,57 @@ func TestFindSessionFile_FindsNestedCodexSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Setenv("CODEX_HOME", filepath.Join(tmpDir, ".codex"))
+	codexHome := filepath.Join(tmpDir, ".codex")
 
-	if got := findSessionFile(sessionID); got != fname {
+	if got := findSessionFile(sessionID, codexHome); got != fname {
 		t.Fatalf("findSessionFile(%q) = %q, want %q", sessionID, got, fname)
+	}
+}
+
+func TestAgentSessionOperationsUseConfiguredCodexHome(t *testing.T) {
+	tmpDir := t.TempDir()
+	envHome := filepath.Join(tmpDir, "env-home")
+	configuredHome := filepath.Join(tmpDir, "configured-home")
+	workDir := filepath.Join(tmpDir, "workspace")
+	sessionID := "configured-home-session"
+	sessionsDir := filepath.Join(configuredHome, "sessions", "2026", "04", "20")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("CODEX_HOME", envHome)
+
+	fname := filepath.Join(sessionsDir, "rollout-"+sessionID+".jsonl")
+	data := `{"timestamp":"2026-04-20T12:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","source":"exec","originator":"codex_exec","cwd":"` + workDir + `"}}` + "\n" +
+		`{"timestamp":"2026-04-20T12:00:01Z","type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"hello from configured home"}]}}` + "\n"
+	if err := os.WriteFile(fname, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	agent := &Agent{workDir: workDir, codexHome: configuredHome}
+	sessions, err := agent.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != sessionID {
+		t.Fatalf("ListSessions = %#v, want configured session %q", sessions, sessionID)
+	}
+
+	history, err := agent.GetSessionHistory(context.Background(), sessionID, 10)
+	if err != nil {
+		t.Fatalf("GetSessionHistory: %v", err)
+	}
+	if len(history) != 1 || history[0].Content != "hello from configured home" {
+		t.Fatalf("GetSessionHistory = %#v, want configured session history", history)
+	}
+
+	if err := agent.DeleteSession(context.Background(), sessionID); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	if _, err := os.Stat(fname); !os.IsNotExist(err) {
+		t.Fatalf("session file still exists after DeleteSession: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -166,6 +167,37 @@ func TestTelegramReplyHelpers_WaitForIncomingReplyRegistry(t *testing.T) {
 	}
 	if got := telegramReplyToContent(msg); got != "late reply metadata" {
 		t.Fatalf("telegramReplyToContent wait = %q, want late reply metadata", got)
+	}
+}
+
+func TestTelegramPrivateTopicSessionKeyUsesThreadID(t *testing.T) {
+	p := &Platform{}
+	if got := p.buildSessionKey(100, 55, 7); got != "telegram:100:55:7" {
+		t.Fatalf("session key = %q, want telegram:100:55:7", got)
+	}
+}
+
+func TestTelegramUpdateDecodePreservesPrivateTopicThreadID(t *testing.T) {
+	var updates []telegramUpdate
+	if err := json.Unmarshal([]byte(`[{
+		"update_id": 1,
+		"message": {
+			"message_id": 10,
+			"message_thread_id": 55,
+			"date": 1,
+			"text": "hello",
+			"from": {"id": 7, "first_name": "Alice"},
+			"chat": {"id": 100, "type": "private"}
+		}
+	}]`), &updates); err != nil {
+		t.Fatalf("unmarshal update: %v", err)
+	}
+	if len(updates) != 1 || updates[0].Message == nil {
+		t.Fatalf("decoded updates = %#v", updates)
+	}
+	msg := updates[0].Message
+	if got := usableTelegramThreadID(msg); got != 55 {
+		t.Fatalf("usable thread ID = %d, want 55", got)
 	}
 }
 

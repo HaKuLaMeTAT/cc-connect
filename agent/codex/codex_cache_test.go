@@ -45,3 +45,12 @@ func TestAvailableModels_FallbackToModelsCache(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultCodexModels_IncludesGPT55(t *testing.T) {
+	for _, m := range defaultCodexModels() {
+		if m.Name == "gpt-5.5" {
+			return
+		}
+	}
+	t.Fatalf("default models missing gpt-5.5: %v", defaultCodexModels())
+}

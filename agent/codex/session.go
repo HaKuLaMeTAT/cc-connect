@@ -174,7 +174,7 @@ func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 			}
 		}
 		if tid := cs.CurrentSessionID(); tid != "" {
-			patchSessionSource(tid)
+			patchSessionSource(tid, getenvFromList(cs.extraEnv, "CODEX_HOME"))
 		}
 	}()
 
